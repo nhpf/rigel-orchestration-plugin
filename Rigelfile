@@ -1,30 +1,79 @@
-# This Rigelfile file was automatically generate by Rigel.
-# Feel free to alter it according to your needs.
-
 ---
 
-# OPTIONAL section
 vars:
-    distro: "noetic"
+  distro: "noetic"
+  prebuilt_image: "nhopf/turtle-rigel:latest" # docker.io/nhopf/turtle-rigel:latest -- TODO: ADAPT BASED ON PEDRO'S INPUT
 
-
-# REQUIRED section
 application:
-    distro: "{{ vars.distro }}"
+  distro: "{{ vars.distro }}"
 
-
-# REQUIRED section
 jobs:
-    dummy:
-        plugin: "src.plugin.Plugin"
-        # Field `with` is ALWAYS required (even if not)
-        with:
-            unused: "unused"
+  #  dockerfile:
+  #    plugin: "rigel.plugins.core.dockerfile"
+  #    with: {}
+  #
+  #  build:
+  #    plugin: "rigel.plugins.core.BuildXPlugin"
+  #    with: {}
+  deploy_k8s:
+    plugin: "src.plugin.OrchestrationPlugin"
+    with:
+      orchestration:
+        deploy_ros_master: true
+        readiness:
+          command: "/usr/local/bin/readiness_probe.sh"
+        observability:
+          enabled: true
+        rolling_update:
+          strategy: "Rolling"
+          max_surge: 1
+          max_unavailable: 0
+        distributed:
+          enabled: true
+          default_to_remote: true
+          force_local_flag: false
+        persistent_storage:
+          volumes:
+            - name: "logs-volume"
+              size: "1Gi"
+              storage_class: "standard"
+        additional_k8s_params:
+          # This merges with the base Deployment spec in your plugin
+          # For example, let's specify a command for the ros-master container to ensure it runs roscore
+          ros_master:
+            spec:
+              template:
+                spec:
+                  containers:
+                    - name: "ros-master-container"
+                      image: "ros:noetic-ros-core"
+                      command: [ "/ros_entrypoint.sh" ]
+                      args: [ "roscore" ]
+                      # command: [ "/bin/bash", "-c" ]
+                      # args: [ "source /opt/ros/noetic/setup.bash && roscore" ]
+          application:
+            spec:
+              template:
+                spec:
+                  containers:
+                    - name: "ros-app"
+                      # An image that actually runs a ROS node or rostopic
+                      # image: "ros:noetic-ros-base"
+                      image: "{{ vars.prebuilt_image }}" # The pre-built image
+                      # command: ["/bin/bash", "-c", "sleep infinity"]
+                      readinessProbe:
+                        exec:
+                          command: [ "/usr/local/bin/readiness_probe.sh" ]
+                        initialDelaySeconds: 10
+                        periodSeconds: 5
+                      env:
+                        - name: CUSTOM_ENV
+                          value: "TESTING"
+                      ports:
+                        - containerPort: 11311
 
-
-# OPTIONAL section
 sequences:
-    demo:
-        stages:
-            -
-                jobs: ["dummy"]
+  demo:
+    stages:
+      -
+        jobs: ["deploy_k8s"]  # ["dockerfile", "build", "deploy_k8s"]
