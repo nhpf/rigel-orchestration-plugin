@@ -1,0 +1,37 @@
+[tool.poetry]
+name = "rigel-orchestration"
+version = "0.1.0"
+description = "An orchestration tool that enables Rigel to manage the deployment of applications with Kubernetes."
+authors = ["Nicholas Hopf <nicholas.hopf@inesctec.pt>"]
+readme = "README.md"
+
+[tool.poetry.dependencies]
+python = "^3.9"
+pydantic = "^2.10.4"
+
+[tool.poetry.group.dev.dependencies]
+pytest = "^8.3.4"
+pytest-cov = "^6.0.0"
+ruff = "^0.8.6"
+mypy = "^1.14.1"
+pre-commit = "^4.0.1"
+
+[tool.ruff]
+line-length = 120
+lint.select = ["ALL"]
+lint.ignore = ["D100", "D104", "D203", "D213"]
+exclude = ["venv", ".venv", "build", "dist"]
+
+[tool.mypy]
+python_version = "3.12"
+check_untyped_defs = true
+ignore_missing_imports = true
+strict_optional = true
+
+[tool.pytest.ini_options]
+minversion = "8.3"
+addopts = "--cov=src --cov-report=term-missing"
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"

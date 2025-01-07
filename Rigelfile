@@ -1,0 +1,30 @@
+# This Rigelfile file was automatically generate by Rigel.
+# Feel free to alter it according to your needs.
+
+---
+
+# OPTIONAL section
+vars:
+    distro: "noetic"
+
+
+# REQUIRED section
+application:
+    distro: "{{ vars.distro }}"
+
+
+# REQUIRED section
+jobs:
+    dummy:
+        plugin: "src.plugin.Plugin"
+        # Field `with` is ALWAYS required (even if not)
+        with:
+            unused: "unused"
+
+
+# OPTIONAL section
+sequences:
+    demo:
+        stages:
+            -
+                jobs: ["dummy"]
