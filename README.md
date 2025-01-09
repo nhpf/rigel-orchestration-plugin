@@ -11,10 +11,13 @@ This is the repository for a Rigel plugin that orchestrates ROS applications on 
 
 ## Development Setup
 
-At first, clone the repository and install `rigel` directly at root level with the following command (keep in mind the git branch to be used):
+Make sure you have Python 3.9+ and [Poetry](https://python-poetry.org/docs/) installed.
+
+Clone the repository and install the dependencies with Poetry:
 
 ```bash
-pip install git+https://github.com/rigel-ros/rigel@develop
+poetry env activate
+poetry install
 ```
 
 ## Requirements
@@ -34,7 +37,7 @@ pip install git+https://github.com/rigel-ros/rigel@develop
 
 4. **Run** the sequence to deploy:
    ```bash
-   rigel run sequence demo
+   poetry run rigel run sequence demo
    ```
 
 5. **Check** the pods:

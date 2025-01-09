@@ -1,14 +1,19 @@
-[tool.poetry]
-name = "rigel-orchestration"
+[project]
+name = "src"
 version = "0.1.0"
 description = "An orchestration tool that enables Rigel to manage the deployment of applications with Kubernetes."
-authors = ["Nicholas Hopf <nicholas.hopf@inesctec.pt>"]
+authors = [{ name = "Nicholas Hopf", email = "nicholas.hopf@inesctec.pt" }]
 readme = "README.md"
+requires-python = ">=3.9,<4.0"
+dependencies = [
+    "pydantic (<2.0)",
+    "kubernetes (>=31.0.0,<32.0.0)",
+    "rigel @ git+https://github.com/rigel-ros/rigel.git@develop"
+]
 
-[tool.poetry.dependencies]
-python = "^3.9"
-pydantic = "<2.0"
-kubernetes = "^31.0.0"
+[build-system]
+requires = ["poetry-core>=2.0.0,<3.0.0"]
+build-backend = "poetry.core.masonry.api"
 
 [tool.poetry.group.dev.dependencies]
 pytest = "^8.3.4"
@@ -41,7 +46,3 @@ strict_optional = true
 [tool.pytest.ini_options]
 minversion = "8.3"
 addopts = "--cov=src --cov-report=term-missing"
-
-[build-system]
-requires = ["poetry-core"]
-build-backend = "poetry.core.masonry.api"
