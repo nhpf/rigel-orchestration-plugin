@@ -29,11 +29,11 @@ jobs:
 
       - name: Lint with Ruff
         run: |
-          poetry run ruff src tests
+          poetry run ruff check src tests
 
       - name: Type-check with mypy
         run: |
-          poetry run mypy src tests
+          poetry run mypy src tests --pretty
 
       - name: Create kind cluster
         uses: helm/kind-action@v1
