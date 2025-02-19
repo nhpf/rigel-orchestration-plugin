@@ -47,7 +47,7 @@ jobs:
               size: "1Gi"
               storage_class: "standard"
         additional_k8s_params:
-          # This merges with the base Deployment spec in your plugin
+          # This merges with the base Deployment spec in the plugin
           # For example, let's specify a command for the ros-master container to ensure it runs roscore
           ros_master:
             spec:
