@@ -11,18 +11,18 @@ This is the repository for a Rigel plugin that orchestrates ROS applications on 
 
 ## Development Setup
 
-Make sure you have Python 3.9+ and [Poetry](https://python-poetry.org/docs/) installed.
+Make sure you have Python 3.10+ and [Poetry](https://python-poetry.org/docs/) installed.
 
 Clone the repository and install the dependencies with Poetry:
 
 ```bash
-poetry env activate
+poetry shell
 poetry install
 ```
 
 ## Requirements
 
-- A running Kubernetes cluster (e.g., [Minikube](https://minikube.sigs.k8s.io/docs/), [kind](https://kind.sigs.k8s.io/), or a cloud provider).
+- A **running** Kubernetes cluster (e.g., [Minikube](https://minikube.sigs.k8s.io/docs/), [kind](https://kind.sigs.k8s.io/), or a cloud provider).
 - A **pre-built ROS Docker image** (if you follow the example in this repo, we use `ros:noetic-ros-core` or a custom image that starts `roscore` plus a simple talker node).
 
 ## Quick Start
