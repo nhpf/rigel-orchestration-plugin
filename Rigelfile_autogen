@@ -1,0 +1,128 @@
+# This file was generate by RIGEL.
+# Feel free to alter it according to your needs.
+
+---
+
+#
+# Use the 'vars field' to declare variables whose value you may need to use
+# multiple times throughout this file.
+#
+# References to declared variables is possible with the {{ <var> }} syntax.
+# You can also use the same syntax to refer to existing system environment variables.
+#
+vars:
+  distro: noetic
+  build_load: True
+  build_push: False
+
+#
+# Specify your target ROS distribution.
+# This target distribution must be the same for all listed packages.
+#
+distro: '{{ distro }}'  # reference to declared global variable
+
+#
+# Use the 'jobs' field to list all jobs to be considered.
+# Each job has an unique identifier <JOB_IDENTIFIER> and has associated:
+# - a plugin entrypoint class to be called at runtime. You can use either plugins
+# provided by Rigel or use your own custom plugins.
+# - a list of target package identifiers. Packages in this list must support the
+# job in question and provide data for it. A single package identifier can
+# be provided instead. By default the value "all" is used, and all packages are
+# considered as targets.
+#
+# You can execute jobs with the command:
+# rigel run job <JOB_IDENTIFIER>
+#
+# STRUCTURE:
+#
+# jobs:
+#   <JOB_IDENTIFIER_0>:
+#     plugin: <PYTHON_PLUGIN_MODULE>
+#     targets: [<PACKAGE_IDENTIFIER_0>, ...] | <PACKAGE_IDENTIFIER> | "all"
+#   ...
+#   <JOB_IDENTIFIER_n>:
+#     plugin: <PYTHON_PLUGIN_MODULE>
+#     targets: [<PACKAGE_IDENTIFIER_0>, ...] | <PACKAGE_IDENTIFIER> | "all"
+#
+jobs:
+
+  dockerfile:
+    plugin: "rigel.plugins.core.Dockerfile"
+    targets: "all"
+
+  build:
+    plugin: "rigel.plugins.core.BuildXPlugin"
+    targets: "all"
+
+#
+# Use the 'packages' field to list all the ROS packages to be considered.
+# Each package has an unique identifier <PKG_IDENTIFIER>
+# and consists of a list of supported jobs.
+# Proper data must be provided for each supported job.
+#
+# Additional information regarding SSH and image registries can also be declared.
+#
+# STRUCTURE:
+#
+# packages:
+#   <PKG_IDENTIFIER_0>
+#     jobs:
+#       <SUPPORTED_JOB_IDENTIFIER_0>:
+#         <JOB_0_KWARG_0_KEY>: <JOB_0_KWARG_0_VALUE>
+#         <JOB_0_KWARG_1_KEY>: <JOB_0_KWARG_1_VALUE>
+#             ...
+#       <SUPPORTED_JOB_IDENTIFIER_1>:
+#         ...
+#       ...
+#   ...
+#   <PKG_IDENTIFIER_n>:
+#     jobs:
+#       <SUPPORTED_JOB_IDENTIFIER_0>:
+#         <JOB_0_KWARG_0_KEY>: <JOB_0_KWARG_0_VALUE>
+#         <JOB_0_KWARG_1_KEY>: <JOB_0_KWARG_1_VALUE>
+#             ...
+#       <SUPPORTED_JOB_IDENTIFIER_1>:
+#
+packages:
+
+  publisher:
+    dir: "rigel_test/publisher"
+    pip:
+      - rospkg
+      - prometheus_client
+    jobs:
+      dockerfile:
+        command: "rostopic pub -r 1 /chatter std_msgs/String '{\"data\": \"Hello\"}'"
+      build:
+        image: rigel-test-publisher:{{ distro }}
+        load: {{ build_load }}
+        push: {{ build_push }}
+
+  subscriber:
+    dir: "rigel_test/subscriber"
+    jobs:
+      dockerfile:
+        command: "rostopic echo /chatter"
+      build:
+        image: rigel-test-subsriber:{{ distro }}
+        load: {{ build_load }}
+        push: {{ build_push }}
+
+#
+# Use the 'sequences' field to automate the sequential execution of jobs.
+# Each sequence has an unique sequence identifier <SEQ_IDENTIFIER> and consists
+# of a list of job identifiers <JOB_IDENTIFIER>.
+#
+# You can execute job sequences with the command:
+# rigel run sequence <SEQ_IDENTIFIER>
+#
+# STRUCTURE:
+#
+# sequences:
+#   <SEQ_IDENTIFIER_0>: [<JOB_IDENTIFIER_0>, ...]
+#   <SEQ_IDENTIFIER_1>: [<JOB_IDENTIFIER_0>, ...]
+#   ...
+#   <SEQ_IDENTIFIER_2>: [<JOB_IDENTIFIER_0>, ...]
+#
+sequences: {}

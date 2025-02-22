@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import subprocess
 import time
+from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 # Kubernetes client library
@@ -219,18 +221,48 @@ class OrchestrationPlugin(PluginBase):
                 LOGGER.warning(f"Error reading or updating application deployment: {e}")
 
     def job_configure_observability(self) -> None:
-        """Set up Promtail, Loki, Prometheus, Grafana, etc.
-
-        TODO: This can be quite involved in real life, but here we do a placeholder.
-        """
+        """Configure the observability stack (Promtail, Loki, Prometheus, Grafana)."""
         if not self.orch.observability or not self.orch.observability.enabled:
             LOGGER.info("Observability is disabled; skipping configuration.")
             return
 
         LOGGER.info("Configuring observability stack (Promtail, Loki, Prometheus, Grafana)...")
-        # In a real scenario: create helm releases, or create Deployments/Services for each component, etc.
-        # For demonstration, we log a message.
-        # If the user wants to override or provide custom YAML, they'd do it via additional_k8s_params.
+
+        commands = [
+            "helm repo add grafana https://grafana.github.io/helm-charts",
+            "helm repo update",
+            "helm install prometheus grafana/prometheus",
+            "helm install loki grafana/loki-stack",
+            "helm install grafana grafana/grafana",
+        ]
+
+        for command in commands:
+            subprocess.run(command, shell=True, check=True)  # noqa: S602
+
+        # Configure Promtail to send logs to Loki
+        promtail_config = """
+        server:
+          http_listen_port: 9080
+
+        clients:
+          - url: http://loki:3100/loki/api/v1/push
+
+        scrape_configs:
+          - job_name: system
+            static_configs:
+              - targets:
+                  - localhost
+                labels:
+                  job: system
+                  __path__: /var/log/*log
+        """
+
+        with Path("/tmp/promtail-config.yaml").open("w") as f:  # noqa: S108
+            f.write(promtail_config)
+
+        subprocess.run("kubectl apply -f /tmp/promtail-config.yaml", shell=True, check=True)  # noqa: S602, S607
+
+        LOGGER.info("Observability stack configured successfully.")
 
     def job_check_readiness(self) -> bool:
         """Ensure the system is "ready" before any destructive action (like rolling update).

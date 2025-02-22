@@ -36,6 +36,9 @@ exclude = ["venv", ".venv", "build", "dist"]
     "PLR2004", # Magic value used in comparison
     "S311", # Standard pseudo-random generators are not suitable for cryptographic purposes
 ]
+"app_testing/**/*.py" = [
+    "ALL",
+]
 
 [tool.mypy]
 python_version = "3.13"

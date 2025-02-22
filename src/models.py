@@ -54,7 +54,7 @@ class DistributedConfig(BaseModel):
 class KubernetesOrchestrationModel(BaseModel):
     """Kubernetes Orchestration configuration for the application."""
 
-    deploy_ros_master: bool = False
+    deploy_ros_master: bool = True
     readiness: ReadinessConfig | None = None
     observability: ObservabilityConfig | None = None
     rolling_update: RollingUpdateConfig | None = None
