@@ -78,11 +78,27 @@ jobs:
                       env:
                         - name: CUSTOM_ENV
                           value: "TESTING"
+                        - name: APP_VERSION
+                          value: "{{ vars.base_image | regex_replace('.*:', '') }}"
                       ports:
                         - containerPort: 11311
+  update_k8s:
+    plugin: "src.plugin.OrchestrationPlugin"
+    with:
+      orchestration:
+        rolling_update:
+          strategy: "Rolling"
+          max_surge: 1
+          max_unavailable: 0
+        readiness:
+          command: "/usr/local/bin/readiness_probe.sh"
 
 sequences:
   demo:
     stages:
       -
         jobs: ["dockerfile", "build", "deploy_k8s"]
+  update:
+    stages:
+      -
+        jobs: ["dockerfile", "build", "update_k8s"]

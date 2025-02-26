@@ -44,7 +44,7 @@ def update_rigelfile(version="1.0.0"):
     
     # Update the base_image version
     updated_content = content.replace(
-        'base_image: "nhopf/turtle-rigel:latest"', 
+        'base_image: "nhopf/turtle-rigel:1.0.0"', 
         f'base_image: "nhopf/turtle-rigel:{version}"'
     )
     
@@ -95,7 +95,7 @@ def deploy_application():
     print_step(4, "Deploying the application with Rigel")
     
     # Run Rigel to deploy the application
-    run_command("rigel run demo")
+    run_command("rigel run sequence demo")
     
     # Wait for deployment to be ready
     print("Waiting for deployment to be ready...")
@@ -130,7 +130,7 @@ def update_application(new_version):
     
     # Apply the update
     print("Applying the update with Rigel...")
-    run_command("rigel run demo")
+    run_command("rigel run sequence update")
     
     # Wait for the rolling update to complete
     print("Waiting for rolling update to complete...")
