@@ -348,10 +348,7 @@ class OrchestrationPlugin(PluginBase):
             LOGGER.warning(f"Error applying rolling update: {e}")
 
     def job_distributed_deployment(self) -> None:
-        """Apply node selectors / tolerations if 'distributed.enabled' is true (and not forced local).
-
-        TODO: This is a simplified example.
-        """
+        """Apply node selectors / tolerations if 'distributed.enabled' is true (and not forced local)."""
         if not self.orch.distributed or not self.orch.distributed.enabled:
             LOGGER.info("Distributed deployment is disabled; skipping.")
             return
