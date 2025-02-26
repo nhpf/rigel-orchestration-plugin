@@ -24,15 +24,46 @@ def print_command(cmd):
     """Print a command that will be executed."""
     print(f"{YELLOW}$ {cmd}{RESET}")
 
-def run_command(cmd, check=True):
-    """Run a shell command and print its output."""
-    print_command(cmd)
-    result = subprocess.run(cmd, shell=True, check=check, text=True, capture_output=True)
-    if result.stdout:
-        print(result.stdout)
-    if result.stderr:
-        print(f"{RED}{result.stderr}{RESET}")
-    return result
+def run_command(cmd, check=True, capture_output=True):
+    """Run a shell command with improved error handling.
+    
+    Args:
+        cmd (str): Command to run
+        check (bool): Raise an exception on non-zero exit code
+        capture_output (bool): Capture command output
+    
+    Returns:
+        subprocess.CompletedProcess: Result of the command
+    """
+    try:
+        print_command(cmd)
+        result = subprocess.run(cmd, shell=True, check=check, text=True, capture_output=capture_output)
+        
+        if result.stdout:
+            print(result.stdout)
+        
+        if result.stderr:
+            print(f"{RED}{result.stderr}{RESET}")
+        
+        return result
+    
+    except subprocess.CalledProcessError as e:
+        print(f"{RED}[ERROR] Command '{cmd}' failed with exit code {e.returncode}{RESET}")
+        if e.stderr:
+            print(f"{RED}[STDERR]{RESET}")
+            print(e.stderr)
+        
+        # Provide more context about potential issues
+        if "rigel" in cmd:
+            print(f"{YELLOW}Possible Rigel-related issues:{RESET}")
+            print("- Ensure Rigel is installed and in PATH")
+            print("- Check Rigelfile syntax")
+            print("- Verify sequence and job names")
+            print("- Make sure you're in the Poetry environment (try 'poetry shell' first)")
+        
+        if check:
+            raise
+        return e
 
 def update_rigelfile(version="1.0.0"):
     """Update the Rigelfile with a new base_image version."""
@@ -42,11 +73,26 @@ def update_rigelfile(version="1.0.0"):
     with open("Rigelfile", "r") as f:
         content = f.read()
     
-    # Update the base_image version
-    updated_content = content.replace(
-        'base_image: "nhopf/turtle-rigel:1.0.0"', 
-        f'base_image: "nhopf/turtle-rigel:{version}"'
-    )
+    # Update the base_image version - handle both 1.0.0 and 1.1.0 patterns
+    if 'base_image: "nhopf/turtle-rigel:1.0.0"' in content:
+        updated_content = content.replace(
+            'base_image: "nhopf/turtle-rigel:1.0.0"', 
+            f'base_image: "nhopf/turtle-rigel:{version}"'
+        )
+    elif 'base_image: "nhopf/turtle-rigel:1.1.0"' in content:
+        updated_content = content.replace(
+            'base_image: "nhopf/turtle-rigel:1.1.0"', 
+            f'base_image: "nhopf/turtle-rigel:{version}"'
+        )
+    else:
+        # Find the base_image line using regex
+        import re
+        pattern = r'base_image: "nhopf/turtle-rigel:[^"]+"'
+        updated_content = re.sub(
+            pattern,
+            f'base_image: "nhopf/turtle-rigel:{version}"',
+            content
+        )
     
     # Write the updated Rigelfile
     with open("Rigelfile", "w") as f:
@@ -95,7 +141,7 @@ def deploy_application():
     print_step(4, "Deploying the application with Rigel")
     
     # Run Rigel to deploy the application
-    run_command("rigel run sequence demo")
+    run_command("poetry run rigel run sequence demo")
     
     # Wait for deployment to be ready
     print("Waiting for deployment to be ready...")
@@ -130,7 +176,7 @@ def update_application(new_version):
     
     # Apply the update
     print("Applying the update with Rigel...")
-    run_command("rigel run sequence update")
+    run_command("poetry run rigel run sequence update")
     
     # Wait for the rolling update to complete
     print("Waiting for rolling update to complete...")
