@@ -127,3 +127,4 @@ sequences:
     stages:
       -
         jobs: ["deploy_k8s"]
+    description: "Deploy and configure the observability stack (Prometheus, Loki, Grafana)"

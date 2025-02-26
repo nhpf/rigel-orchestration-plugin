@@ -1215,6 +1215,17 @@ if __name__ == '__main__':
         """Orchestrate the main logic of your plugin."""
         LOGGER.info("[START] OrchestrationPlugin start.")
 
+        # Get the sequence name that was used to run this plugin
+        sequence_name = self.global_data.get("sequence_name", "")
+        LOGGER.info(f"Running sequence: {sequence_name}")
+
+        # If this is the observability sequence, only run the observability job
+        if sequence_name == "observability":
+            LOGGER.info("Running observability sequence")
+            self.job_configure_observability()
+            return
+
+        # Standard deployment sequence
         # 1) Deploy ros-master if configured
         if self.orch.deploy_ros_master:
             self.job_deploy_ros_master()
@@ -1227,7 +1238,8 @@ if __name__ == '__main__':
         self.job_deploy_application()
 
         # 4) Configure observability if enabled
-        self.job_configure_observability()
+        if self.orch.observability and self.orch.observability.enabled:
+            self.job_configure_observability()
 
         # 5) Check readiness
         #    (This also ensures that if the user wants to do a rolling update next,
