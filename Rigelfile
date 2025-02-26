@@ -33,6 +33,27 @@ jobs:
           command: "/usr/local/bin/readiness_probe.sh"
         observability:
           enabled: true
+          grafana:
+            enabled: true
+            admin_password: "rigel-admin"
+            default_dashboards: true
+            service_type: "NodePort"
+            persistence:
+              enabled: true
+              size: "2Gi"
+          prometheus:
+            enabled: true
+            scrape_interval: "10s"
+            evaluation_interval: "10s"
+            retention: "7d"
+          loki:
+            enabled: true
+            retention: "7d"
+            persistence:
+              enabled: true
+              size: "5Gi"
+          node_exporter: true
+          ros_metrics: true
         rolling_update:
           strategy: "Rolling"
           max_surge: 1
@@ -102,3 +123,7 @@ sequences:
     stages:
       -
         jobs: ["dockerfile", "build", "update_k8s"]
+  observability:
+    stages:
+      -
+        jobs: ["deploy_k8s"]

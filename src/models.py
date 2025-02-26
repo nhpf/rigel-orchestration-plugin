@@ -15,10 +15,34 @@ class ObservabilityConfig(BaseModel):
     """Observability configuration for the application."""
 
     enabled: bool = False
-    grafana: dict[str, Any] | None = None
-    prometheus: dict[str, Any] | None = None
-    loki: dict[str, Any] | None = None
-    # Add more fields if needed, e.g., custom config paths, credentials, etc.
+    grafana: dict[str, Any] = Field(
+        default_factory=lambda: {
+            "enabled": True,
+            "admin_password": "admin",
+            "default_dashboards": True,
+            "service_type": "NodePort",
+            "persistence": {"enabled": True, "size": "2Gi"},
+        }
+    )
+    prometheus: dict[str, Any] = Field(
+        default_factory=lambda: {
+            "enabled": True,
+            "scrape_interval": "15s",
+            "evaluation_interval": "15s",
+            "retention": "24h",
+            "service_type": "ClusterIP",
+        }
+    )
+    loki: dict[str, Any] = Field(
+        default_factory=lambda: {
+            "enabled": True,
+            "retention": "24h",
+            "service_type": "ClusterIP",
+            "persistence": {"enabled": True, "size": "5Gi"},
+        }
+    )
+    node_exporter: bool = True
+    ros_metrics: bool = True
 
 
 class RollingUpdateConfig(BaseModel):

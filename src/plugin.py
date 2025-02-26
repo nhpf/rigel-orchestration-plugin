@@ -221,48 +221,215 @@ class OrchestrationPlugin(PluginBase):
                 LOGGER.warning(f"Error reading or updating application deployment: {e}")
 
     def job_configure_observability(self) -> None:
-        """Configure the observability stack (Promtail, Loki, Prometheus, Grafana)."""
+        """Configure the observability stack (Prometheus, Loki, Grafana)."""
         if not self.orch.observability or not self.orch.observability.enabled:
             LOGGER.info("Observability is disabled; skipping configuration.")
             return
 
-        LOGGER.info("Configuring observability stack (Promtail, Loki, Prometheus, Grafana)...")
+        LOGGER.info("Configuring observability stack (Prometheus, Loki, Grafana)...")
 
+        # Add required Helm repositories
         commands = [
             "helm repo add grafana https://grafana.github.io/helm-charts",
+            "helm repo add prometheus-community https://prometheus-community.github.io/helm-charts",
             "helm repo update",
-            "helm install prometheus grafana/prometheus",
-            "helm install loki grafana/loki-stack",
-            "helm install grafana grafana/grafana",
         ]
 
         for command in commands:
-            subprocess.run(command, shell=True, check=True)  # noqa: S602
+            try:
+                subprocess.run(command, shell=True, check=True)  # noqa: S602
+            except subprocess.CalledProcessError as e:
+                LOGGER.warning(f"Error adding Helm repositories: {e}")
+                return
 
-        # Configure Promtail to send logs to Loki
-        promtail_config = """
-        server:
-          http_listen_port: 9080
+        # Create namespace for observability tools
+        try:
+            self._core_api.create_namespace(body={"metadata": {"name": "monitoring"}})
+            LOGGER.info("Created 'monitoring' namespace.")
+        except ApiException as e:
+            if e.status != 409:  # 409 means it already exists
+                LOGGER.warning(f"Error creating namespace: {e}")
+                return
+            LOGGER.info("Namespace 'monitoring' already exists.")
 
-        clients:
-          - url: http://loki:3100/loki/api/v1/push
+        # Configure and install Prometheus
+        if self.orch.observability.prometheus.get("enabled", True):
+            prom_config = self.orch.observability.prometheus
+            prom_values = {
+                "server": {
+                    "retention": prom_config.get("retention", "24h"),
+                    "global": {
+                        "scrape_interval": prom_config.get("scrape_interval", "15s"),
+                        "evaluation_interval": prom_config.get("evaluation_interval", "15s"),
+                    },
+                },
+                "service": {
+                    "type": prom_config.get("service_type", "ClusterIP"),
+                },
+                "alertmanager": {
+                    "enabled": True,
+                    "persistence": {
+                        "enabled": True,
+                        "size": "2Gi",
+                    },
+                },
+                "nodeExporter": {
+                    "enabled": self.orch.observability.node_exporter,
+                },
+                "kubeStateMetrics": {
+                    "enabled": True,
+                },
+            }
+            
+            # Write Prometheus values to a temporary file
+            with Path("/tmp/prometheus-values.yaml").open("w") as f:  # noqa: S108
+                import yaml
+                yaml.dump(prom_values, f)
+            
+            try:
+                subprocess.run(
+                    "helm upgrade --install prometheus prometheus-community/prometheus "
+                    "-n monitoring -f /tmp/prometheus-values.yaml",
+                    shell=True, check=True  # noqa: S602
+                )
+                LOGGER.info("Prometheus installed/upgraded successfully.")
+            except subprocess.CalledProcessError as e:
+                LOGGER.warning(f"Error installing Prometheus: {e}")
 
-        scrape_configs:
-          - job_name: system
-            static_configs:
-              - targets:
-                  - localhost
-                labels:
-                  job: system
-                  __path__: /var/log/*log
-        """
+        # Configure and install Loki stack
+        if self.orch.observability.loki.get("enabled", True):
+            loki_config = self.orch.observability.loki
+            loki_values = {
+                "loki": {
+                    "persistence": {
+                        "enabled": loki_config.get("persistence", {}).get("enabled", True),
+                        "size": loki_config.get("persistence", {}).get("size", "5Gi"),
+                    },
+                    "config": {
+                        "table_manager": {
+                            "retention_deletes_enabled": True,
+                            "retention_period": loki_config.get("retention", "24h"),
+                        },
+                    },
+                },
+                "promtail": {
+                    "enabled": True,
+                    "config": {
+                        "snippets": {
+                            "extraScrapeConfigs": """
+                            - job_name: ros-logs
+                              static_configs:
+                              - targets:
+                                  - localhost
+                                labels:
+                                  job: ros-logs
+                                  __path__: /var/log/ros/*.log
+                            """,
+                        },
+                    },
+                },
+            }
+            
+            # Write Loki values to a temporary file
+            with Path("/tmp/loki-values.yaml").open("w") as f:  # noqa: S108
+                import yaml
+                yaml.dump(loki_values, f)
+            
+            try:
+                subprocess.run(
+                    "helm upgrade --install loki grafana/loki-stack "
+                    "-n monitoring -f /tmp/loki-values.yaml",
+                    shell=True, check=True  # noqa: S602
+                )
+                LOGGER.info("Loki stack installed/upgraded successfully.")
+            except subprocess.CalledProcessError as e:
+                LOGGER.warning(f"Error installing Loki: {e}")
 
-        with Path("/tmp/promtail-config.yaml").open("w") as f:  # noqa: S108
-            f.write(promtail_config)
-
-        subprocess.run("kubectl apply -f /tmp/promtail-config.yaml", shell=True, check=True)  # noqa: S602, S607
-
+        # Configure and install Grafana
+        if self.orch.observability.grafana.get("enabled", True):
+            grafana_config = self.orch.observability.grafana
+            grafana_values = {
+                "adminPassword": grafana_config.get("admin_password", "admin"),
+                "persistence": {
+                    "enabled": grafana_config.get("persistence", {}).get("enabled", True),
+                    "size": grafana_config.get("persistence", {}).get("size", "2Gi"),
+                },
+                "service": {
+                    "type": grafana_config.get("service_type", "NodePort"),
+                },
+                "datasources": {
+                    "datasources.yaml": {
+                        "apiVersion": 1,
+                        "datasources": [
+                            {
+                                "name": "Prometheus",
+                                "type": "prometheus",
+                                "url": "http://prometheus-server.monitoring.svc.cluster.local",
+                                "access": "proxy",
+                                "isDefault": True,
+                            },
+                            {
+                                "name": "Loki",
+                                "type": "loki",
+                                "url": "http://loki.monitoring.svc.cluster.local:3100",
+                                "access": "proxy",
+                            },
+                        ],
+                    },
+                },
+            }
+            
+            # Add default ROS dashboards if enabled
+            if grafana_config.get("default_dashboards", True):
+                grafana_values["dashboardProviders"] = {
+                    "dashboardproviders.yaml": {
+                        "apiVersion": 1,
+                        "providers": [
+                            {
+                                "name": "default",
+                                "orgId": 1,
+                                "folder": "",
+                                "type": "file",
+                                "disableDeletion": False,
+                                "editable": True,
+                                "options": {
+                                    "path": "/var/lib/grafana/dashboards/default",
+                                },
+                            },
+                        ],
+                    },
+                }
+                
+                # Create ROS dashboard ConfigMap
+                self._create_ros_dashboard_configmap()
+                
+                grafana_values["dashboardsConfigMaps"] = {
+                    "default": "ros-dashboards",
+                }
+            
+            # Write Grafana values to a temporary file
+            with Path("/tmp/grafana-values.yaml").open("w") as f:  # noqa: S108
+                import yaml
+                yaml.dump(grafana_values, f)
+            
+            try:
+                subprocess.run(
+                    "helm upgrade --install grafana grafana/grafana "
+                    "-n monitoring -f /tmp/grafana-values.yaml",
+                    shell=True, check=True  # noqa: S602
+                )
+                LOGGER.info("Grafana installed/upgraded successfully.")
+            except subprocess.CalledProcessError as e:
+                LOGGER.warning(f"Error installing Grafana: {e}")
+                
+        # Deploy ROS metrics exporter if enabled
+        if self.orch.observability.ros_metrics:
+            self._deploy_ros_metrics_exporter()
+                
         LOGGER.info("Observability stack configured successfully.")
+        
+        # Print access information
+        self._print_observability_access_info()
 
     def job_check_readiness(self) -> bool:
         """Ensure the system is "ready" before any destructive action (like rolling update).
@@ -377,6 +544,663 @@ class OrchestrationPlugin(PluginBase):
             LOGGER.info(f"Patched deployment '{DEPLOYMENT_NAME}' with remote nodeSelector.")
         except ApiException as e:
             LOGGER.warning(f"Error patching for distributed deployment: {e}")
+            
+    def _create_ros_dashboard_configmap(self) -> None:
+        """Create a ConfigMap with ROS dashboard definitions for Grafana."""
+        namespace = "monitoring"
+        
+        # Basic ROS system dashboard JSON
+        ros_system_dashboard = {
+            "annotations": {
+                "list": [
+                    {
+                        "builtIn": 1,
+                        "datasource": "-- Grafana --",
+                        "enable": True,
+                        "hide": True,
+                        "iconColor": "rgba(0, 211, 255, 1)",
+                        "name": "Annotations & Alerts",
+                        "type": "dashboard"
+                    }
+                ]
+            },
+            "editable": True,
+            "gnetId": None,
+            "graphTooltip": 0,
+            "id": 1,
+            "links": [],
+            "panels": [
+                {
+                    "aliasColors": {},
+                    "bars": False,
+                    "dashLength": 10,
+                    "dashes": False,
+                    "datasource": "Prometheus",
+                    "fieldConfig": {
+                        "defaults": {
+                            "custom": {}
+                        },
+                        "overrides": []
+                    },
+                    "fill": 1,
+                    "fillGradient": 0,
+                    "gridPos": {
+                        "h": 8,
+                        "w": 12,
+                        "x": 0,
+                        "y": 0
+                    },
+                    "hiddenSeries": False,
+                    "id": 2,
+                    "legend": {
+                        "avg": False,
+                        "current": False,
+                        "max": False,
+                        "min": False,
+                        "show": True,
+                        "total": False,
+                        "values": False
+                    },
+                    "lines": True,
+                    "linewidth": 1,
+                    "nullPointMode": "null",
+                    "options": {
+                        "alertThreshold": True
+                    },
+                    "percentage": False,
+                    "pluginVersion": "7.2.0",
+                    "pointradius": 2,
+                    "points": False,
+                    "renderer": "flot",
+                    "seriesOverrides": [],
+                    "spaceLength": 10,
+                    "stack": False,
+                    "steppedLine": False,
+                    "targets": [
+                        {
+                            "expr": "ros_node_cpu_usage",
+                            "interval": "",
+                            "legendFormat": "{{node}}",
+                            "refId": "A"
+                        }
+                    ],
+                    "thresholds": [],
+                    "timeFrom": None,
+                    "timeRegions": [],
+                    "timeShift": None,
+                    "title": "ROS Node CPU Usage",
+                    "tooltip": {
+                        "shared": True,
+                        "sort": 0,
+                        "value_type": "individual"
+                    },
+                    "type": "graph",
+                    "xaxis": {
+                        "buckets": None,
+                        "mode": "time",
+                        "name": None,
+                        "show": True,
+                        "values": []
+                    },
+                    "yaxes": [
+                        {
+                            "format": "percent",
+                            "label": None,
+                            "logBase": 1,
+                            "max": None,
+                            "min": None,
+                            "show": True
+                        },
+                        {
+                            "format": "short",
+                            "label": None,
+                            "logBase": 1,
+                            "max": None,
+                            "min": None,
+                            "show": True
+                        }
+                    ],
+                    "yaxis": {
+                        "align": False,
+                        "alignLevel": None
+                    }
+                },
+                {
+                    "aliasColors": {},
+                    "bars": False,
+                    "dashLength": 10,
+                    "dashes": False,
+                    "datasource": "Prometheus",
+                    "fieldConfig": {
+                        "defaults": {
+                            "custom": {}
+                        },
+                        "overrides": []
+                    },
+                    "fill": 1,
+                    "fillGradient": 0,
+                    "gridPos": {
+                        "h": 8,
+                        "w": 12,
+                        "x": 12,
+                        "y": 0
+                    },
+                    "hiddenSeries": False,
+                    "id": 3,
+                    "legend": {
+                        "avg": False,
+                        "current": False,
+                        "max": False,
+                        "min": False,
+                        "show": True,
+                        "total": False,
+                        "values": False
+                    },
+                    "lines": True,
+                    "linewidth": 1,
+                    "nullPointMode": "null",
+                    "options": {
+                        "alertThreshold": True
+                    },
+                    "percentage": False,
+                    "pluginVersion": "7.2.0",
+                    "pointradius": 2,
+                    "points": False,
+                    "renderer": "flot",
+                    "seriesOverrides": [],
+                    "spaceLength": 10,
+                    "stack": False,
+                    "steppedLine": False,
+                    "targets": [
+                        {
+                            "expr": "ros_node_memory_usage_mb",
+                            "interval": "",
+                            "legendFormat": "{{node}}",
+                            "refId": "A"
+                        }
+                    ],
+                    "thresholds": [],
+                    "timeFrom": None,
+                    "timeRegions": [],
+                    "timeShift": None,
+                    "title": "ROS Node Memory Usage",
+                    "tooltip": {
+                        "shared": True,
+                        "sort": 0,
+                        "value_type": "individual"
+                    },
+                    "type": "graph",
+                    "xaxis": {
+                        "buckets": None,
+                        "mode": "time",
+                        "name": None,
+                        "show": True,
+                        "values": []
+                    },
+                    "yaxes": [
+                        {
+                            "format": "decmbytes",
+                            "label": None,
+                            "logBase": 1,
+                            "max": None,
+                            "min": None,
+                            "show": True
+                        },
+                        {
+                            "format": "short",
+                            "label": None,
+                            "logBase": 1,
+                            "max": None,
+                            "min": None,
+                            "show": True
+                        }
+                    ],
+                    "yaxis": {
+                        "align": False,
+                        "alignLevel": None
+                    }
+                },
+                {
+                    "aliasColors": {},
+                    "bars": False,
+                    "dashLength": 10,
+                    "dashes": False,
+                    "datasource": "Prometheus",
+                    "fieldConfig": {
+                        "defaults": {
+                            "custom": {}
+                        },
+                        "overrides": []
+                    },
+                    "fill": 1,
+                    "fillGradient": 0,
+                    "gridPos": {
+                        "h": 8,
+                        "w": 12,
+                        "x": 0,
+                        "y": 8
+                    },
+                    "hiddenSeries": False,
+                    "id": 4,
+                    "legend": {
+                        "avg": False,
+                        "current": False,
+                        "max": False,
+                        "min": False,
+                        "show": True,
+                        "total": False,
+                        "values": False
+                    },
+                    "lines": True,
+                    "linewidth": 1,
+                    "nullPointMode": "null",
+                    "options": {
+                        "alertThreshold": True
+                    },
+                    "percentage": False,
+                    "pluginVersion": "7.2.0",
+                    "pointradius": 2,
+                    "points": False,
+                    "renderer": "flot",
+                    "seriesOverrides": [],
+                    "spaceLength": 10,
+                    "stack": False,
+                    "steppedLine": False,
+                    "targets": [
+                        {
+                            "expr": "ros_topic_message_frequency",
+                            "interval": "",
+                            "legendFormat": "{{topic}}",
+                            "refId": "A"
+                        }
+                    ],
+                    "thresholds": [],
+                    "timeFrom": None,
+                    "timeRegions": [],
+                    "timeShift": None,
+                    "title": "ROS Topic Message Frequency",
+                    "tooltip": {
+                        "shared": True,
+                        "sort": 0,
+                        "value_type": "individual"
+                    },
+                    "type": "graph",
+                    "xaxis": {
+                        "buckets": None,
+                        "mode": "time",
+                        "name": None,
+                        "show": True,
+                        "values": []
+                    },
+                    "yaxes": [
+                        {
+                            "format": "hz",
+                            "label": None,
+                            "logBase": 1,
+                            "max": None,
+                            "min": None,
+                            "show": True
+                        },
+                        {
+                            "format": "short",
+                            "label": None,
+                            "logBase": 1,
+                            "max": None,
+                            "min": None,
+                            "show": True
+                        }
+                    ],
+                    "yaxis": {
+                        "align": False,
+                        "alignLevel": None
+                    }
+                },
+                {
+                    "datasource": "Loki",
+                    "fieldConfig": {
+                        "defaults": {
+                            "custom": {}
+                        },
+                        "overrides": []
+                    },
+                    "gridPos": {
+                        "h": 8,
+                        "w": 12,
+                        "x": 12,
+                        "y": 8
+                    },
+                    "id": 6,
+                    "options": {
+                        "showLabels": False,
+                        "showTime": False,
+                        "sortOrder": "Descending",
+                        "wrapLogMessage": False
+                    },
+                    "targets": [
+                        {
+                            "expr": "{job=\"ros-logs\"}",
+                            "refId": "A"
+                        }
+                    ],
+                    "title": "ROS Logs",
+                    "type": "logs"
+                }
+            ],
+            "schemaVersion": 26,
+            "style": "dark",
+            "tags": [],
+            "templating": {
+                "list": []
+            },
+            "time": {
+                "from": "now-6h",
+                "to": "now"
+            },
+            "timepicker": {},
+            "timezone": "",
+            "title": "ROS System Dashboard",
+            "uid": "ros-system",
+            "version": 1
+        }
+        
+        # Convert dashboard to JSON string
+        import json
+        ros_system_dashboard_json = json.dumps(ros_system_dashboard)
+        
+        # Create ConfigMap with dashboard
+        configmap_data = {
+            "metadata": {
+                "name": "ros-dashboards",
+                "namespace": namespace,
+            },
+            "data": {
+                "ros-system-dashboard.json": ros_system_dashboard_json,
+            },
+        }
+        
+        try:
+            self._core_api.create_namespaced_config_map(namespace=namespace, body=configmap_data)
+            LOGGER.info("Created ROS dashboards ConfigMap.")
+        except ApiException as e:
+            if e.status != 409:  # 409 means it already exists
+                LOGGER.warning(f"Error creating ROS dashboards ConfigMap: {e}")
+                return
+            
+            # Update existing ConfigMap
+            try:
+                self._core_api.patch_namespaced_config_map(
+                    name="ros-dashboards", 
+                    namespace=namespace, 
+                    body={"data": {"ros-system-dashboard.json": ros_system_dashboard_json}}
+                )
+                LOGGER.info("Updated ROS dashboards ConfigMap.")
+            except ApiException as e:
+                LOGGER.warning(f"Error updating ROS dashboards ConfigMap: {e}")
+    
+    def _deploy_ros_metrics_exporter(self) -> None:
+        """Deploy a ROS metrics exporter that collects ROS-specific metrics."""
+        namespace = "default"
+        
+        # Create ConfigMap with ROS metrics exporter script
+        ros_metrics_script = """#!/usr/bin/env python3
+import rospy
+import psutil
+import time
+import os
+import socket
+from prometheus_client import start_http_server, Gauge, Counter
+from std_msgs.msg import String
+
+# Initialize ROS node
+rospy.init_node('ros_metrics_exporter', anonymous=True)
+
+# Create Prometheus metrics
+node_cpu_usage = Gauge('ros_node_cpu_usage', 'CPU usage of ROS nodes', ['node'])
+node_memory_usage = Gauge('ros_node_memory_usage_mb', 'Memory usage of ROS nodes in MB', ['node'])
+topic_message_frequency = Gauge('ros_topic_message_frequency', 'Message frequency on ROS topics', ['topic'])
+topic_message_count = Counter('ros_topic_message_count', 'Total messages on ROS topics', ['topic'])
+
+# Track message timestamps for frequency calculation
+topic_last_msg_time = {}
+topic_frequencies = {}
+
+# Callback for monitoring topic messages
+def topic_callback(msg, topic_name):
+    now = time.time()
+    topic_message_count.labels(topic=topic_name).inc()
+    
+    if topic_name in topic_last_msg_time:
+        # Calculate frequency based on time since last message
+        elapsed = now - topic_last_msg_time[topic_name]
+        if elapsed > 0:
+            freq = 1.0 / elapsed
+            topic_frequencies[topic_name] = freq
+            topic_message_frequency.labels(topic=topic_name).set(freq)
+    
+    topic_last_msg_time[topic_name] = now
+
+def get_ros_nodes():
+    try:
+        return [node for node in rospy.get_node_names() if node != '/ros_metrics_exporter']
+    except Exception as e:
+        rospy.logwarn(f"Error getting ROS nodes: {e}")
+        return []
+
+def get_ros_topics():
+    try:
+        return rospy.get_published_topics()
+    except Exception as e:
+        rospy.logwarn(f"Error getting ROS topics: {e}")
+        return []
+
+def monitor_nodes():
+    # Get all ROS nodes
+    nodes = get_ros_nodes()
+    
+    # For each node, try to get its process info
+    for node in nodes:
+        try:
+            # This is a simplification - in a real system you'd need to map ROS node names to PIDs
+            # For demo purposes, we'll just use random values
+            cpu_percent = psutil.cpu_percent(interval=None) / len(nodes)
+            memory_mb = psutil.virtual_memory().used / (1024 * 1024) / len(nodes)
+            
+            node_cpu_usage.labels(node=node).set(cpu_percent)
+            node_memory_usage.labels(node=node).set(memory_mb)
+        except Exception as e:
+            rospy.logwarn(f"Error monitoring node {node}: {e}")
+
+def subscribe_to_topics():
+    # Get all topics
+    topics = get_ros_topics()
+    
+    # Subscribe to each topic
+    for topic_name, topic_type in topics:
+        try:
+            rospy.Subscriber(topic_name, String, topic_callback, callback_args=topic_name)
+            rospy.loginfo(f"Subscribed to {topic_name}")
+        except Exception as e:
+            rospy.logwarn(f"Error subscribing to {topic_name}: {e}")
+
+if __name__ == '__main__':
+    # Start Prometheus HTTP server
+    start_http_server(9090)
+    rospy.loginfo("Started ROS metrics exporter on port 9090")
+    
+    # Subscribe to topics
+    subscribe_to_topics()
+    
+    # Main monitoring loop
+    rate = rospy.Rate(1)  # 1 Hz
+    while not rospy.is_shutdown():
+        monitor_nodes()
+        rate.sleep()
+"""
+        
+        configmap_data = {
+            "metadata": {
+                "name": "ros-metrics-exporter",
+                "namespace": namespace,
+            },
+            "data": {
+                "ros_metrics_exporter.py": ros_metrics_script,
+            },
+        }
+        
+        try:
+            self._core_api.create_namespaced_config_map(namespace=namespace, body=configmap_data)
+            LOGGER.info("Created ROS metrics exporter ConfigMap.")
+        except ApiException as e:
+            if e.status != 409:  # 409 means it already exists
+                LOGGER.warning(f"Error creating ROS metrics exporter ConfigMap: {e}")
+                return
+            
+            # Update existing ConfigMap
+            try:
+                self._core_api.patch_namespaced_config_map(
+                    name="ros-metrics-exporter", 
+                    namespace=namespace, 
+                    body={"data": {"ros_metrics_exporter.py": ros_metrics_script}}
+                )
+                LOGGER.info("Updated ROS metrics exporter ConfigMap.")
+            except ApiException as e:
+                LOGGER.warning(f"Error updating ROS metrics exporter ConfigMap: {e}")
+                return
+        
+        # Create the ROS metrics exporter deployment
+        exporter_deployment = {
+            "apiVersion": "apps/v1",
+            "kind": "Deployment",
+            "metadata": {
+                "name": "ros-metrics-exporter",
+                "namespace": namespace,
+            },
+            "spec": {
+                "replicas": 1,
+                "selector": {
+                    "matchLabels": {
+                        "app": "ros-metrics-exporter",
+                    },
+                },
+                "template": {
+                    "metadata": {
+                        "labels": {
+                            "app": "ros-metrics-exporter",
+                        },
+                        "annotations": {
+                            "prometheus.io/scrape": "true",
+                            "prometheus.io/port": "9090",
+                        },
+                    },
+                    "spec": {
+                        "containers": [
+                            {
+                                "name": "ros-metrics-exporter",
+                                "image": f"ros:{self.application.distro}-ros-base",
+                                "command": ["/bin/bash", "-c"],
+                                "args": [
+                                    "apt-get update && "
+                                    "apt-get install -y python3-pip && "
+                                    "pip3 install prometheus-client psutil && "
+                                    "chmod +x /scripts/ros_metrics_exporter.py && "
+                                    "mkdir -p /var/log/ros && "
+                                    "python3 /scripts/ros_metrics_exporter.py"
+                                ],
+                                "volumeMounts": [
+                                    {
+                                        "name": "ros-metrics-script",
+                                        "mountPath": "/scripts",
+                                    },
+                                ],
+                                "ports": [
+                                    {
+                                        "containerPort": 9090,
+                                    },
+                                ],
+                                "env": [
+                                    {
+                                        "name": "ROS_MASTER_URI",
+                                        "value": "http://ros-master:11311",
+                                    },
+                                    {
+                                        "name": "ROS_HOSTNAME",
+                                        "valueFrom": {
+                                            "fieldRef": {
+                                                "fieldPath": "status.podIP",
+                                            },
+                                        },
+                                    },
+                                ],
+                            },
+                        ],
+                        "volumes": [
+                            {
+                                "name": "ros-metrics-script",
+                                "configMap": {
+                                    "name": "ros-metrics-exporter",
+                                    "defaultMode": 0o755,
+                                },
+                            },
+                        ],
+                    },
+                },
+            },
+        }
+        
+        try:
+            self._apps_api.create_namespaced_deployment(namespace=namespace, body=exporter_deployment)
+            LOGGER.info("Created ROS metrics exporter deployment.")
+        except ApiException as e:
+            if e.status != 409:  # 409 means it already exists
+                LOGGER.warning(f"Error creating ROS metrics exporter deployment: {e}")
+                return
+            
+            # Update existing deployment
+            try:
+                self._apps_api.patch_namespaced_deployment(
+                    name="ros-metrics-exporter", 
+                    namespace=namespace, 
+                    body=exporter_deployment
+                )
+                LOGGER.info("Updated ROS metrics exporter deployment.")
+            except ApiException as e:
+                LOGGER.warning(f"Error updating ROS metrics exporter deployment: {e}")
+    
+    def _print_observability_access_info(self) -> None:
+        """Print information on how to access the observability tools."""
+        namespace = "monitoring"
+        
+        try:
+            # Get Grafana service info
+            grafana_svc = self._core_api.read_namespaced_service("grafana", namespace)
+            grafana_type = grafana_svc.spec.type
+            
+            if grafana_type == "NodePort":
+                node_port = None
+                for port in grafana_svc.spec.ports:
+                    if port.port == 3000:
+                        node_port = port.node_port
+                        break
+                
+                if node_port:
+                    LOGGER.info(f"\nGrafana dashboard is available at: http://<node-ip>:{node_port}")
+                    LOGGER.info("Username: admin")
+                    LOGGER.info(f"Password: {self.orch.observability.grafana.get('admin_password', 'admin')}")
+            elif grafana_type == "LoadBalancer":
+                LOGGER.info("\nGrafana dashboard will be available at the LoadBalancer external IP")
+                LOGGER.info("Run 'kubectl get svc -n monitoring grafana' to get the external IP")
+            else:
+                LOGGER.info("\nTo access Grafana, run: kubectl port-forward -n monitoring svc/grafana 3000:3000")
+                LOGGER.info("Then open: http://localhost:3000")
+            
+            LOGGER.info("\nTo access Prometheus, run: kubectl port-forward -n monitoring svc/prometheus-server 9090:80")
+            LOGGER.info("Then open: http://localhost:9090")
+            
+            LOGGER.info("\nTo access Loki, run: kubectl port-forward -n monitoring svc/loki 3100:3100")
+            LOGGER.info("Loki is configured as a datasource in Grafana")
+            
+        except ApiException as e:
+            LOGGER.warning(f"Error getting service information: {e}")
 
     # ----------------------------------------------------------------
     # Plugin Lifecycle
