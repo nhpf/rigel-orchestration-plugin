@@ -872,14 +872,28 @@ def main():
     """Main function to deploy the observability stack."""
     # Set up Kubernetes client
     try:
-        config.load_kube_config()
-        LOGGER.info("Using local kubeconfig")
+        # Try to detect if we're running in minikube
+        if subprocess.run(["which", "minikube"], stdout=subprocess.PIPE, stderr=subprocess.PIPE).returncode == 0:
+            try:
+                # Get minikube docker env and apply it
+                LOGGER.info("Detected minikube, trying to use minikube context")
+                subprocess.run(["minikube", "start"], check=False)
+                config.load_kube_config(context="minikube")
+                LOGGER.info("Using minikube context")
+            except Exception as e:
+                LOGGER.warning(f"Failed to use minikube context: {e}, falling back to default kubeconfig")
+                config.load_kube_config()
+        else:
+            config.load_kube_config()
+            LOGGER.info("Using local kubeconfig")
     except Exception:
         try:
             config.load_incluster_config()
             LOGGER.info("Using in-cluster config")
         except Exception as e:
             LOGGER.error(f"Could not configure Kubernetes client: {e}")
+            LOGGER.error("Make sure you have a running Kubernetes cluster and kubectl is configured correctly")
+            LOGGER.error("You might need to run: minikube start")
             return False
 
     core_api = CoreV1Api()
