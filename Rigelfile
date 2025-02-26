@@ -2,7 +2,7 @@
 
 vars:
   distro: "noetic"
-  base_image: "nhopf/turtle-rigel:latest"
+  base_image: "nhopf/turtle-rigel:1.0.0"
 
 application:
   distro: "{{ vars.distro }}"
