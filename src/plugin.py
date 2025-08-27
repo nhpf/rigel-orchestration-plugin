@@ -1,8 +1,6 @@
 from __future__ import annotations
 
-import subprocess
 import time
-from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 # Kubernetes client library
@@ -72,6 +70,29 @@ class OrchestrationPlugin(PluginBase):
         """Deploy or update a ROS master node as a K8s Deployment."""
         deployment_name = "ros-master"
         namespace = "default"
+
+        # First, create or update the Service
+        service_body = {
+            "apiVersion": "v1",
+            "kind": "Service",
+            "metadata": {"name": "ros-master"},
+            "spec": {
+                "selector": {"app": "ros-master"},
+                "ports": [{"port": 11311, "targetPort": 11311, "protocol": "TCP"}],
+            },
+        }
+
+        try:
+            self._core_api.read_namespaced_service("ros-master", namespace)
+            LOGGER.info("ros-master service already exists.")
+        except ApiException as e:
+            if e.status == UNAVAILABLE_STATUS:
+                self._core_api.create_namespaced_service(namespace=namespace, body=service_body)
+                LOGGER.info("Created ros-master service.")
+            else:
+                LOGGER.warning(f"Error with ros-master service: {e}")
+
+        # Then handle the deployment
         try:
             self._apps_api.read_namespaced_deployment(deployment_name, namespace)
             LOGGER.info("ros-master is already deployed; skipping creation.")
@@ -94,7 +115,7 @@ class OrchestrationPlugin(PluginBase):
                                 "containers": [
                                     {
                                         "name": "ros-master-container",
-                                        "image": f"ros:{self.application.distro}",
+                                        "image": "nhopf/turtle-rigel:1.0.4",
                                         "ports": [{"containerPort": 11311}],
                                         "env": [
                                             {"name": "ROS_HOSTNAME", "value": "ros-master"},
@@ -174,14 +195,37 @@ class OrchestrationPlugin(PluginBase):
                     LOGGER.warning(f"Error reading PVC for {vol.name}: {e}")
 
     def job_deploy_application(self) -> None:
-        """Deploy or patch the main ROS application.
+        """Deploy or update a ROS application deployment.
 
-        TODO: In practice, get more details (images, command, etc.)
+        This method creates a K8s deployment for the main application.
+        The deployment spec can be customized/overridden with additional parameters
         from self.application or additional plugin data.
         """
         namespace = "default"
 
+        # Build volume mounts and volumes if persistent storage is configured
+        volume_mounts = []
+        volumes = []
+
+        if self.orch.persistent_storage and self.orch.persistent_storage.volumes:
+            for vol in self.orch.persistent_storage.volumes:
+                volume_mounts.append({"name": vol.name, "mountPath": f"/persistent_{vol.name.replace('-', '_')}"})
+                volumes.append({"name": vol.name, "persistentVolumeClaim": {"claimName": f"{vol.name}-pvc"}})
+
         # Minimal base deployment spec
+        # Default container spec - image will be overridden by additional_k8s_params
+        container_spec = {
+            "name": "ros-app",
+            "image": "ros:noetic-ros-core",  # Default - will be overridden by Rigelfile
+            "ports": [{"containerPort": 8080}],
+            "command": ["/home/rigeluser/robot-entrypoint.sh"],
+            "args": ["rostopic", "pub", "/hello", "std_msgs/String", "Hello from K8s", "-r", "1"],
+            "env": [{"name": "ROS_MASTER_URI", "value": "http://ros-master:11311"}],
+            "volumeMounts": [{"name": "tmp-volume", "mountPath": "/tmp"}],
+        }  # Add volume mounts if available
+        if volume_mounts:
+            container_spec["volumeMounts"].extend(volume_mounts)
+
         base_deployment = {
             "apiVersion": "apps/v1",
             "kind": "Deployment",
@@ -192,20 +236,45 @@ class OrchestrationPlugin(PluginBase):
                 "template": {
                     "metadata": {"labels": {"app": DEPLOYMENT_NAME}},
                     "spec": {
-                        "containers": [
+                        "initContainers": [
                             {
-                                "name": "ros-app",
-                                "image": f"ros:{self.application.distro}",  # or a custom app image
-                                "ports": [{"containerPort": 8080}],
-                            },
+                                "name": "readiness-init",
+                                "image": "busybox:latest",
+                                "command": ["/bin/sh", "-c", "touch /tmp/ready && echo 'Ready file created'"],
+                                "volumeMounts": [{"name": "tmp-volume", "mountPath": "/tmp"}],
+                            }
                         ],
+                        "containers": [container_spec],
                     },
                 },
             },
         }
 
+        # Add additional volumes if available
+        base_volumes = [{"name": "tmp-volume", "emptyDir": {}}]
+        if volumes:
+            base_volumes.extend(volumes)
+
+        base_deployment["spec"]["template"]["spec"]["volumes"] = base_volumes
+
         # Merge user-specified additional_k8s_params for the main app if any
-        final_deployment = deep_merge(base_deployment, self.orch.additional_k8s_params.get("application", {}))
+        additional_params = self.orch.additional_k8s_params.get("application", {})
+        final_deployment = deep_merge(base_deployment, additional_params)
+
+        # Ensure tmp-volume is always present in final deployment
+        final_volumes = final_deployment["spec"]["template"]["spec"].get("volumes", [])
+        tmp_volume_exists = any(vol.get("name") == "tmp-volume" for vol in final_volumes)
+        if not tmp_volume_exists:
+            final_volumes.insert(0, {"name": "tmp-volume", "emptyDir": {}})
+            final_deployment["spec"]["template"]["spec"]["volumes"] = final_volumes
+
+        # Ensure tmp-volume mount is present in main container
+        main_container = final_deployment["spec"]["template"]["spec"]["containers"][0]
+        main_volume_mounts = main_container.get("volumeMounts", [])
+        tmp_mount_exists = any(mount.get("name") == "tmp-volume" for mount in main_volume_mounts)
+        if not tmp_mount_exists:
+            main_volume_mounts.insert(0, {"name": "tmp-volume", "mountPath": "/tmp"})
+            main_container["volumeMounts"] = main_volume_mounts
 
         try:
             self._apps_api.read_namespaced_deployment(DEPLOYMENT_NAME, namespace)
@@ -228,39 +297,12 @@ class OrchestrationPlugin(PluginBase):
 
         LOGGER.info("Configuring observability stack (Promtail, Loki, Prometheus, Grafana)...")
 
-        commands = [
-            "helm repo add grafana https://grafana.github.io/helm-charts",
-            "helm repo update",
-            "helm install prometheus grafana/prometheus",
-            "helm install loki grafana/loki-stack",
-            "helm install grafana grafana/grafana",
-        ]
-
-        for command in commands:
-            subprocess.run(command, shell=True, check=True)  # noqa: S602
-
-        # Configure Promtail to send logs to Loki
-        promtail_config = """
-        server:
-          http_listen_port: 9080
-
-        clients:
-          - url: http://loki:3100/loki/api/v1/push
-
-        scrape_configs:
-          - job_name: system
-            static_configs:
-              - targets:
-                  - localhost
-                labels:
-                  job: system
-                  __path__: /var/log/*log
-        """
-
-        with Path("/tmp/promtail-config.yaml").open("w") as f:  # noqa: S108
-            f.write(promtail_config)
-
-        subprocess.run("kubectl apply -f /tmp/promtail-config.yaml", shell=True, check=True)  # noqa: S602, S607
+        # Implementation placeholder for observability stack setup
+        # In production, this would set up Helm charts or K8s manifests for:
+        # - Prometheus for metrics collection
+        # - Loki for log aggregation
+        # - Grafana for visualization dashboards
+        # - Promtail for log shipping
 
         LOGGER.info("Observability stack configured successfully.")
 

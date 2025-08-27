@@ -1,0 +1,47 @@
+version: "3.8"
+
+services:
+  # The ROS master
+  roscore:
+    image: ros:noetic-ros-core
+    container_name: roscore
+    command: roscore
+    networks:
+      - ros-net
+
+  # The arithmetic server
+  arithmetic_server:
+    build:
+      context: ./server
+    container_name: arithmetic_server
+    depends_on:
+      - roscore
+    environment:
+      - ROS_MASTER_URI=http://roscore:11311
+      - ROS_HOSTNAME=arithmetic_server
+    networks:
+      - ros-net
+
+  # The arithmetic client
+  arithmetic_client:
+    build:
+      context: ./client
+    container_name: arithmetic_client
+    depends_on:
+      - roscore
+      - arithmetic_server
+    environment:
+      - ROS_MASTER_URI=http://roscore:11311
+      - ROS_HOSTNAME=arithmetic_client
+    networks:
+      - ros-net
+    # Named volume for persistent logs:
+    volumes:
+      - arithmetic_logs:/persistent_volume
+
+networks:
+  ros-net:
+    driver: bridge
+
+volumes:
+  arithmetic_logs:

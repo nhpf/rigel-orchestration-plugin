@@ -1,8 +1,11 @@
 ---
-# Rigel Kubernetes Orchestration Plugin - Test Configuration
+# Rigel Kubernetes Orchestration Plugin - Example Configuration
+# Copy this file to Rigelfile and customize for your ROS project
+
 vars:
   distro: "noetic"
-  base_image: "nhopf/turtle-rigel:1.0.4"
+  # Set your Docker image name and tag here
+  base_image: "your-registry/your-ros-app:latest"
 
 application:
   distro: "{{ vars.distro }}"
@@ -22,32 +25,46 @@ jobs:
     plugin: "rigel.plugins.core.BuildXPlugin"
     with:
       image: "{{ vars.base_image }}"
-      load: true
-      push: false
+      load: true  # Set to false and configure providers to push to registry
+      push: false # Set to true to push to configured registry
 
   deploy_k8s:
     plugin: "src.plugin.OrchestrationPlugin"
     with:
       orchestration:
+        # Deploy ROS master service automatically
         deploy_ros_master: true
+        
+        # Readiness probe configuration
         readiness:
           command: "/usr/local/bin/readiness_probe.sh"
+        
+        # Enable observability stack (optional)
         observability:
           enabled: true
+        
+        # Rolling update strategy
         rolling_update:
           strategy: "Rolling"
           max_surge: 1
           max_unavailable: 0
+        
+        # Distributed deployment (optional)
         distributed:
           enabled: false
           default_to_remote: true
           force_local_flag: false
+        
+        # Persistent storage configuration
         persistent_storage:
           volumes:
             - name: "logs-volume"
               size: "1Gi"
               storage_class: "standard"
+        
+        # Additional Kubernetes parameters
         additional_k8s_params:
+          # ROS Master configuration
           ros_master:
             spec:
               template:
@@ -57,6 +74,8 @@ jobs:
                       image: "ros:{{ vars.distro }}-ros-core"
                       command: ["/ros_entrypoint.sh"]
                       args: ["roscore"]
+          
+          # Application configuration
           application:
             spec:
               template:
@@ -82,7 +101,7 @@ jobs:
                         periodSeconds: 5
                       env:
                         - name: CUSTOM_ENV
-                          value: "TESTING"
+                          value: "PRODUCTION"
                         - name: APP_VERSION
                           value: "{{ vars.base_image | regex_replace('.*:', '') }}"
                         - name: ROS_MASTER_URI
@@ -109,9 +128,12 @@ jobs:
           command: "/usr/local/bin/readiness_probe.sh"
 
 sequences:
+  # Deploy from scratch
   demo:
     stages:
       - jobs: ["dockerfile", "build", "deploy_k8s"]
+  
+  # Update existing deployment
   update:
     stages:
       - jobs: ["dockerfile", "build", "update_k8s"]

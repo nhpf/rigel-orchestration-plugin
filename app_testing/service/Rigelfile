@@ -1,0 +1,137 @@
+---
+
+vars:
+  distro: "noetic"
+  base_image: "nhopf/service-rigel:1.0.0"
+
+application:
+  distro: "{{ vars.distro }}"
+
+jobs:
+  dockerfile:
+    plugin: "rigel.plugins.core.DockerfilePlugin"
+    with:
+      compiler:
+        name: "catkin_make"
+      ros_image: "ros:{{ vars.distro }}-ros-core"
+      command: "roscore"
+      apt:
+        -
+          net-tools
+  build:
+    plugin: "rigel.plugins.core.BuildXPlugin"
+    with:
+      image: "{{ vars.base_image }}" # Rigel assumes that Dockerfile is in the same directory as the Rigelfile
+      load: true # The plugin generates the image locally or pushes. Never both (either stores image locally or pushes)
+      push: false # Specify providers so Rigel can push the image
+  deploy_k8s:
+    plugin: "src.plugin.OrchestrationPlugin"
+    with:
+      orchestration:
+        deploy_ros_master: true
+        readiness:
+          command: "/usr/local/bin/readiness_probe.sh"
+        observability:
+          enabled: true
+          grafana:
+            enabled: true
+            admin_password: "rigel-admin"
+            default_dashboards: true
+            service_type: "NodePort"
+            persistence:
+              enabled: true
+              size: "2Gi"
+          prometheus:
+            enabled: true
+            scrape_interval: "10s"
+            evaluation_interval: "10s"
+            retention: "7d"
+          loki:
+            enabled: true
+            retention: "7d"
+            persistence:
+              enabled: true
+              size: "5Gi"
+          node_exporter: true
+          ros_metrics: true
+        rolling_update:
+          strategy: "Rolling"
+          max_surge: 1
+          max_unavailable: 0
+        distributed:
+          enabled: true
+          default_to_remote: true
+          force_local_flag: false
+        persistent_storage:
+          volumes:
+            - name: "arithmetic_logs"
+              size: "1Gi"
+              storage_class: "standard"
+        additional_k8s_params:
+          # This merges with the base Deployment spec in the plugin
+          # For example, let's specify a command for the ros-master container to ensure it runs roscore
+          ros_master:
+            spec:
+              template:
+                spec:
+                  containers:
+                    - name: "ros-master-container"
+                      image: "ros:noetic-ros-core"
+                      command: [ "/ros_entrypoint.sh" ]
+                      args: [ "roscore" ]
+                      # command: [ "/bin/bash", "-c" ]
+                      # args: [ "source /opt/ros/noetic/setup.bash && roscore" ]
+          application:
+            spec:
+              template:
+                spec:
+                  containers:
+                    - name: "ros-app"
+                      # An image that actually runs a ROS node or rostopic
+                      # image: "ros:noetic-ros-base"
+                      image: "{{ vars.base_image }}" # The pre-built image
+                      # command: ["/bin/bash", "-c", "sleep infinity"]
+                      readinessProbe:
+                        exec:
+                          command: [ "/usr/local/bin/readiness_probe.sh" ]
+                        initialDelaySeconds: 10
+                        periodSeconds: 5
+                      env:
+                        - name: CUSTOM_ENV
+                          value: "TESTING"
+                        - name: APP_VERSION
+                          value: "{{ vars.base_image | regex_replace('.*:', '') }}"
+                      ports:
+                        - containerPort: 11311
+  update_k8s:
+    plugin: "src.plugin.OrchestrationPlugin"
+    with:
+      orchestration:
+        rolling_update:
+          strategy: "Rolling"
+          max_surge: 1
+          max_unavailable: 0
+        readiness:
+          command: "/usr/local/bin/readiness_probe.sh"
+
+packages:
+  service:
+    dir: "app_testing/service"
+    pip:
+      - rospkg
+      - prometheus_client
+      - ros-noetic-rospy-tutorials
+
+sequences:
+  demo:
+    stages:
+      -
+        jobs: ["dockerfile", "build", "deploy_k8s"]
+  update:
+    stages:
+      -
+        jobs: ["dockerfile", "build", "update_k8s"]
+  observability:
+    stages:
+      -
+        jobs: ["deploy_k8s"]
