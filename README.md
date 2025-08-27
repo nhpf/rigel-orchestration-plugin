@@ -1,6 +1,6 @@
 # Kubernetes Orchestration Plugin for Rigel
 
-A comprehensive, production-ready Rigel plugin that orchestrates ROS applications on Kubernetes with automatic ROS Master deployment, readiness probes, persistent storage, rolling updates, and observability.
+Rigel plugin that orchestrates ROS applications on Kubernetes with automatic ROS Master deployment, readiness probes, persistent storage, rolling updates, and observability.
 
 [![Tests](https://img.shields.io/badge/tests-11%2F11%20passing-brightgreen)](tests/)
 [![Coverage](https://img.shields.io/badge/coverage-76%25-yellow)](#)
@@ -387,9 +387,3 @@ The `app_testing/` directory contains complete examples:
 ### Example Complete Configuration
 
 See `Rigelfile.example` for a complete configuration template.
-
-## Support
-
-- Issues: [GitHub Issues](https://github.com/your-org/rigel-orchestration-plugin/issues)
-- Documentation: [Wiki](https://github.com/your-org/rigel-orchestration-plugin/wiki)
-- Discussions: [GitHub Discussions](https://github.com/your-org/rigel-orchestration-plugin/discussions)
