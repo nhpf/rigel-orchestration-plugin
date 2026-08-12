@@ -185,6 +185,21 @@ class PersistentStorageConfig(BaseModel):
     volumes: list[VolumeConfig] = Field(default_factory=list)
 
 
+class ResultsConfig(BaseModel):
+    """Location of application results inside the deployed container."""
+
+    source_path: str = Field(..., min_length=1)
+    container: str = "ros-app"
+
+    @validator("source_path")
+    def absolute_source_path(cls, value: str) -> str:  # noqa: N805 - required by Pydantic 1 validators
+        """Require an unambiguous absolute path for Kubernetes copies."""
+        if not value.startswith("/"):
+            msg = "results.source_path must be an absolute container path"
+            raise ValueError(msg)
+        return value
+
+
 class DistributedConfig(BaseModel):
     """Distributed configuration for the application."""
 
@@ -207,6 +222,7 @@ class KubernetesOrchestrationModel(BaseModel):
     rolling_update: RollingUpdateConfig | None = None
     distributed: DistributedConfig | None = None
     persistent_storage: PersistentStorageConfig | None = None
+    results: ResultsConfig | None = None
     additional_k8s_params: dict[str, Any] = Field(default_factory=dict)
 
 

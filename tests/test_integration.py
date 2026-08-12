@@ -1,4 +1,5 @@
 import os
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -8,24 +9,36 @@ from src.plugin import OrchestrationPlugin
 
 @pytest.mark.integration
 @pytest.mark.skipif(os.environ.get("RUN_K8S_INTEGRATION") != "1", reason="set RUN_K8S_INTEGRATION=1 to enable")
-def test_plugin_end_to_end_in_minikube() -> None:
-    """Test requires a local Minikube (or other cluster) running, and a valid kubeconfig."""
-    # OPTIONAL: start minikube or ensure it's started.
-    # subprocess.run(["minikube", "start"], check=True)  # noqa: ERA001
-
-    # Prepare raw_data that references a real image, readiness script, etc.
+def test_plugin_end_to_end_in_kubernetes(tmp_path: Path) -> None:
+    """Deploy, verify persisted output, export it, and clean up in a disposable cluster."""
     raw_data = {
         "orchestration": {
             "deploy_ros_master": True,
             "application_image": "ros:noetic-ros-core",
             "readiness": {"command": "/bin/true", "timeout_seconds": 180},
+            "persistent_storage": {
+                "volumes": [
+                    {
+                        "name": "integration-results",
+                        "size": "1Mi",
+                        "storage_class": "manual",
+                        "host_path": "/tmp/rigel-integration-results",  # noqa: S108 - disposable kind node
+                        "mount_path": "/results",
+                    }
+                ]
+            },
+            "results": {"source_path": "/results/result.txt"},
             "additional_k8s_params": {
                 "application": {
                     "spec": {
                         "template": {
                             "spec": {
                                 "containers": [
-                                    {"name": "ros-app", "command": ["/bin/bash", "-c"], "args": ["sleep infinity"]}
+                                    {
+                                        "name": "ros-app",
+                                        "command": ["/bin/bash", "-c"],
+                                        "args": ["printf 'rigel-smoke-ok\\n' > /results/result.txt; sleep infinity"],
+                                    }
                                 ]
                             }
                         }
@@ -42,23 +55,23 @@ def test_plugin_end_to_end_in_minikube() -> None:
         shared_data={},
     )
 
-    plugin.start()
+    try:
+        plugin.start()
+        plugin.process()
 
-    # Possibly poll k8s to confirm the Deployment is up
-    # or run plugin.process() again if you do additional logic
-    plugin.process()
+        from kubernetes import client, config
 
-    # We could do kubectl checks, or direct python k8s-client calls
-    # e.g.:
-    from kubernetes import client, config
+        config.load_kube_config()
+        v1 = client.CoreV1Api()
+        pods = v1.list_namespaced_pod(
+            "default",
+            label_selector="app.kubernetes.io/name=rigel-k8s-application",
+        )
+        assert len(pods.items) > 0
+        assert all(pod.status.phase == "Running" for pod in pods.items)
 
-    config.load_kube_config()
-    v1 = client.CoreV1Api()
-    pods = v1.list_namespaced_pod("default", label_selector="app=rigel-k8s-application")
-    assert len(pods.items) > 0
-    # ...
-    # check if it's Running
-    for pod in pods.items:
-        assert pod.status.phase == "Running", f"{pod.metadata.name} not running"
-
-    plugin.stop()
+        destination = tmp_path / "result.txt"
+        plugin.collect_results(destination)
+        assert destination.read_text(encoding="utf-8") == "rigel-smoke-ok\n"
+    finally:
+        plugin.cleanup(delete_storage=True)

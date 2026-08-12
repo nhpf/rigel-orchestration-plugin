@@ -1,119 +1,35 @@
 ---
-# Rigel Kubernetes Orchestration Plugin - Test Configuration
+# Local example. Customize the image and StorageClass before deploying.
 vars:
   distro: "noetic"
-  base_image: "nhopf/turtle-rigel:1.0.4"
+  image: "your-registry/your-ros-app:latest"
 
 application:
   distro: "{{ vars.distro }}"
 
 jobs:
-  dockerfile:
-    plugin: "rigel.plugins.core.DockerfilePlugin"
-    with:
-      compiler:
-        name: "catkin_make"
-      ros_image: "ros:{{ vars.distro }}-ros-core"
-      command: "rostopic pub /hello std_msgs/String 'Hello from K8s' -r 1"
-      apt:
-        - net-tools
-
-  build:
-    plugin: "rigel.plugins.core.BuildXPlugin"
-    with:
-      image: "{{ vars.base_image }}"
-      load: true
-      push: false
-
   deploy_k8s:
     plugin: "src.plugin.OrchestrationPlugin"
     with:
       orchestration:
-        application_image: "{{ vars.base_image }}"
+        namespace: "default"
+        application_image: "{{ vars.image }}"
         deploy_ros_master: true
         readiness:
           command: "/usr/local/bin/readiness_probe.sh"
-        observability:
-          enabled: false
-        rolling_update:
-          strategy: "Rolling"
-          max_surge: 1
-          max_unavailable: 0
-        distributed:
-          enabled: false
-          default_to_remote: true
-          force_local_flag: false
+          timeout_seconds: 120
         persistent_storage:
           volumes:
-            - name: "logs-volume"
+            - name: "results"
               size: "1Gi"
               storage_class: "standard"
-        additional_k8s_params:
-          ros_master:
-            spec:
-              template:
-                spec:
-                  containers:
-                    - name: "ros-master-container"
-                      image: "ros:{{ vars.distro }}-ros-core"
-                      command: ["/ros_entrypoint.sh"]
-                      args: ["roscore"]
-          application:
-            spec:
-              template:
-                spec:
-                  containers:
-                    - name: "ros-app"
-                      image: "{{ vars.base_image }}"
-                      command:
-                        [
-                          "/home/rigeluser/robot-entrypoint.sh",
-                          "rostopic",
-                          "pub",
-                          "/hello",
-                          "std_msgs/String",
-                          "Hello from K8s",
-                          "-r",
-                          "1",
-                        ]
-                      readinessProbe:
-                        exec:
-                          command: ["/usr/local/bin/readiness_probe.sh"]
-                        initialDelaySeconds: 10
-                        periodSeconds: 5
-                      env:
-                        - name: CUSTOM_ENV
-                          value: "TESTING"
-                        - name: APP_VERSION
-                          value: "{{ vars.base_image | regex_replace('.*:', '') }}"
-                        - name: ROS_MASTER_URI
-                          value: "http://ros-master:11311"
-                      ports:
-                        - containerPort: 8080
-                      volumeMounts:
-                        - name: logs-volume
-                          mountPath: /persistent_logs
-                  volumes:
-                    - name: logs-volume
-                      persistentVolumeClaim:
-                        claimName: logs-volume-pvc
-
-  update_k8s:
-    plugin: "src.plugin.OrchestrationPlugin"
-    with:
-      orchestration:
+              mount_path: "/results"
+        results:
+          source_path: "/results"
+          container: "ros-app"
         rolling_update:
           strategy: "Rolling"
           max_surge: 1
           max_unavailable: 0
-        readiness:
-          command: "/usr/local/bin/readiness_probe.sh"
-        application_image: "{{ vars.base_image }}"
-
-sequences:
-  demo:
-    stages:
-      - jobs: ["dockerfile", "build", "deploy_k8s"]
-  update:
-    stages:
-      - jobs: ["dockerfile", "build", "update_k8s"]
+        observability:
+          enabled: false

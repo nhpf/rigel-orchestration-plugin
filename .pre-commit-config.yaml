@@ -4,12 +4,15 @@ repos:
     hooks:
       # Run the linter.
       - id: ruff
+        files: ^(src|tests)/.*\.py$
         args: [ --fix ]
       # Run the formatter.
       - id: ruff-format
+        files: ^(src|tests)/.*\.py$
 
   - repo: https://github.com/pre-commit/mirrors-mypy
     rev: v1.14.1
     hooks:
       - id: mypy
+        files: ^(src|tests)/.*\.py$
         args: ["--pretty"]

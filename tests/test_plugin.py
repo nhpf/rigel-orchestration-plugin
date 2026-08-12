@@ -1,4 +1,5 @@
 import subprocess
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
@@ -27,6 +28,7 @@ def plugin(apis: tuple[MagicMock, MagicMock]) -> OrchestrationPlugin:
                 "persistent_storage": {
                     "volumes": [{"name": "logs", "size": "1Gi", "storage_class": "standard"}],
                 },
+                "results": {"source_path": "/persistent/logs", "container": "ros-app"},
                 "additional_k8s_params": {
                     "application": {
                         "spec": {
@@ -143,6 +145,82 @@ def test_readiness_requires_pods_statuses_and_ready_containers(
         "default",
         label_selector="app.kubernetes.io/name=rigel-k8s-application",
     )
+
+
+def test_collect_results_copies_from_newest_ready_pod(
+    plugin: OrchestrationPlugin,
+    apis: tuple[MagicMock, MagicMock],
+    tmp_path: Path,
+) -> None:
+    _, core_api = apis
+    older = SimpleNamespace(
+        metadata=SimpleNamespace(name="app-old", creation_timestamp="2026-01-01T00:00:00Z"),
+        status=SimpleNamespace(phase="Running", container_statuses=[SimpleNamespace(ready=True)]),
+    )
+    newer = SimpleNamespace(
+        metadata=SimpleNamespace(name="app-new", creation_timestamp="2026-01-02T00:00:00Z"),
+        status=SimpleNamespace(phase="Running", container_statuses=[SimpleNamespace(ready=True)]),
+    )
+    core_api.list_namespaced_pod.return_value.items = [newer, older]
+    runner = MagicMock()
+    plugin._command_runner = runner  # noqa: SLF001 - dependency injection for subprocess verification
+    destination = tmp_path / "results"
+
+    assert plugin.collect_results(destination) == destination
+
+    runner.assert_called_once_with(
+        [
+            "kubectl",
+            "cp",
+            "default/app-new:/persistent/logs",
+            str(destination),
+            "--container",
+            "ros-app",
+        ],
+        check=True,
+    )
+
+
+def test_collect_results_requires_a_ready_pod(plugin: OrchestrationPlugin, apis: tuple[MagicMock, MagicMock]) -> None:
+    _, core_api = apis
+    core_api.list_namespaced_pod.return_value.items = []
+    plugin._command_runner = MagicMock()  # noqa: SLF001 - dependency injection for subprocess verification
+
+    with pytest.raises(RuntimeError, match="No ready pods"):
+        plugin.collect_results(Path("results"))
+
+
+def test_cleanup_preserves_storage_unless_explicitly_requested(
+    plugin: OrchestrationPlugin,
+    apis: tuple[MagicMock, MagicMock],
+) -> None:
+    apps_api, core_api = apis
+
+    plugin.cleanup()
+
+    assert [call.args[0] for call in apps_api.delete_namespaced_deployment.call_args_list] == [
+        "rigel-k8s-application",
+        "ros-master",
+    ]
+    core_api.delete_namespaced_service.assert_called_once_with("ros-master", "default")
+    core_api.delete_namespaced_persistent_volume_claim.assert_not_called()
+
+    plugin.cleanup(delete_storage=True)
+
+    core_api.delete_namespaced_persistent_volume_claim.assert_called_once_with("logs-pvc", "default")
+    core_api.delete_persistent_volume.assert_not_called()
+
+
+def test_result_source_must_be_absolute(apis: tuple[MagicMock, MagicMock]) -> None:
+    with pytest.raises(ValueError, match="results.source_path must be an absolute"):
+        OrchestrationPlugin(
+            raw_data={"orchestration": {"results": {"source_path": "relative/results"}}},
+            global_data={},
+            application=SimpleNamespace(distro="noetic"),
+            providers_data={},
+            apps_api=apis[0],
+            core_api=apis[1],
+        )
 
 
 def test_rolling_and_distributed_patches(plugin: OrchestrationPlugin, apis: tuple[MagicMock, MagicMock]) -> None:
