@@ -1,389 +1,169 @@
-# Kubernetes Orchestration Plugin for Rigel
+# Rigel Kubernetes Orchestration
 
-Rigel plugin that orchestrates ROS applications on Kubernetes with automatic ROS Master deployment, readiness probes, persistent storage, rolling updates, and observability.
+Deploy ROS 1 applications to Kubernetes with a ROS master Service, application
+readiness checks, persistent storage, rolling updates, optional remote-node
+scheduling, and an optional Prometheus/Loki/Grafana stack.
 
-[![Tests](https://img.shields.io/badge/tests-11%2F11%20passing-brightgreen)](tests/)
-[![Coverage](https://img.shields.io/badge/coverage-76%25-yellow)](#)
-[![Python](https://img.shields.io/badge/python-3.10%2B-blue)](#)
+The project can be used in two ways:
 
-## Features
+- `rigel-k8s` is the supported standalone command. It reads the orchestration job
+  from a Rigelfile and does not depend on Rigel itself.
+- `src.plugin.OrchestrationPlugin` remains compatible with the unpublished Rigel
+  0.3 plugin API for environments that already have it installed.
 
-- 🚀 **Automatic ROS Master Deployment**: Deploys and manages ROS Master service for multi-node communication
-- 🔧 **Flexible Container Management**: Supports any ROS Docker image via Rigelfile configuration
-- 🏥 **Health Monitoring**: Built-in readiness probes with init container pattern for reliable startup
-- 💾 **Persistent Storage**: Configurable persistent volumes for logs and data
-- 🔄 **Rolling Updates**: Zero-downtime updates with configurable strategies
-- 📊 **Observability Ready**: Integration points for Prometheus, Loki, and Grafana
-- 🌐 **Distributed Deployment**: Optional multi-node deployment capabilities
-- 🛡️ **Production Hardened**: Kubernetes-native resource management with proper error handling
+Rigel 0.3 was never published and its former Git repository is no longer public.
+The last public Rigel release (0.2.22) has a different plugin API, so it cannot run
+this plugin. For that reason Rigel is no longer an installation dependency.
 
-## Quick Start
+## Requirements
 
-### Prerequisites
+- Python 3.10+
+- A Kubernetes cluster and working kubeconfig (not needed for `--dry-run`)
+- Helm 3.7+ only when observability is enabled (current Loki charts also
+  require Kubernetes 1.25+)
+- Poetry for the development workflow
 
-- Python 3.10+ with [Poetry](https://python-poetry.org/docs/)
-- A running Kubernetes cluster ([Minikube](https://minikube.sigs.k8s.io/docs/), [kind](https://kind.sigs.k8s.io/), or cloud provider)
-- `kubectl` configured to access your cluster
-- Docker for building images
-
-### Installation
-
-1. **Clone and setup the plugin:**
+## Install and run
 
 ```bash
-git clone https://github.com/your-org/rigel-orchestration-plugin.git
-cd rigel-orchestration-plugin
 poetry install
+
+# Render manifests without contacting Kubernetes
+poetry run rigel-k8s Rigelfile.example --dry-run
+
+# Apply the first orchestration job in the file
+poetry run rigel-k8s Rigelfile.example
+
+# Select a job explicitly
+poetry run rigel-k8s Rigelfile.example --job deploy_k8s
 ```
 
-2. **Create your project's Rigelfile:**
-
-```bash
-cp Rigelfile.example Rigelfile
-# Edit Rigelfile to set your image name and configuration
-```
-
-3. **Configure your Docker image:**
-
-```yaml
-# In your Rigelfile
-vars:
-  distro: "noetic"
-  base_image: "your-registry/your-ros-app:latest"
-```
-
-4. **Deploy to Kubernetes:**
-
-```bash
-poetry run rigel run sequence demo
-```
-
-### Verification
-
-Check your deployment:
-
-```bash
-# Check pods
-kubectl get pods -l app=rigel-k8s-application
-kubectl get pods -l app=ros-master
-
-# Check logs
-kubectl logs deployment/ros-master
-kubectl logs deployment/rigel-k8s-application
-
-# Test ROS connectivity (optional)
-kubectl exec -it deployment/rigel-k8s-application -- rostopic list
-```
+The command tries local kubeconfig credentials first and then Kubernetes
+in-cluster credentials. Missing credentials and Kubernetes API errors cause a
+non-zero exit instead of being logged and ignored.
 
 ## Configuration
 
-### Basic Configuration
-
-The plugin is configured entirely through your `Rigelfile`. Here's a minimal example:
+A minimal Rigelfile is:
 
 ```yaml
 vars:
-  distro: "noetic"
-  base_image: "my-registry/my-ros-app:v1.0.0"
+  distro: noetic
+  image: registry.example/robot:v1
+
+application:
+  distro: "{{ vars.distro }}"
 
 jobs:
-  build:
-    plugin: "rigel.plugins.core.BuildXPlugin"
-    with:
-      image: "{{ vars.base_image }}"
-      push: true # Push to registry for K8s access
-
   deploy_k8s:
-    plugin: "src.plugin.OrchestrationPlugin"
+    plugin: src.plugin.OrchestrationPlugin
     with:
       orchestration:
+        application_image: "{{ vars.image }}"
         deploy_ros_master: true
         readiness:
-          command: "/usr/local/bin/readiness_probe.sh"
-        persistent_storage:
-          volumes:
-            - name: "data-volume"
-              size: "5Gi"
-              storage_class: "fast-ssd"
-
-sequences:
-  deploy:
-    stages:
-      - jobs: ["build", "deploy_k8s"]
+          command: /usr/local/bin/readiness_probe.sh
+          timeout_seconds: 120
 ```
 
-### Advanced Configuration Options
+`additional_k8s_params.application` and `additional_k8s_params.ros_master`
+overlay their respective generated manifests. Kubernetes lists whose entries
+have a `name` field—containers, environment variables, volumes, and mounts—are
+merged by name. Other lists are replaced.
 
-#### Persistent Storage
+### Storage
+
+Storage uses dynamic provisioning by default:
 
 ```yaml
 persistent_storage:
   volumes:
-    - name: "logs-volume"
-      size: "1Gi"
-      storage_class: "standard"
-    - name: "data-volume"
-      size: "10Gi"
-      storage_class: "fast-ssd"
+    - name: logs
+      size: 1Gi
+      storage_class: standard
+      mount_path: /var/log/ros
 ```
 
-#### Rolling Update Strategy
+This creates a PVC and mounts it in the application. Set `host_path` only for a
+trusted single-node development cluster; doing so also creates a static PV.
+
+### Rolling updates and distributed scheduling
 
 ```yaml
 rolling_update:
-  strategy: "Rolling"
+  strategy: Rolling
   max_surge: 1
   max_unavailable: 0
+
+distributed:
+  enabled: true
+  default_to_remote: true
+  force_local_flag: false
 ```
 
-#### Custom Environment Variables
+Remote scheduling adds `nodeSelector: {deploymentType: remote}`. Nodes must carry
+that label. `force_local_flag` suppresses the selector.
+
+### Observability
+
+Observability is opt-in and uses Helm OCI charts. Each component accepts a
+release, chart, enabled flag, and arbitrary Helm values:
 
 ```yaml
-additional_k8s_params:
-  application:
-    spec:
-      template:
-        spec:
-          containers:
-            - name: "ros-app"
-              env:
-                - name: ROS_DOMAIN_ID
-                  value: "42"
-                - name: CUSTOM_CONFIG
-                  value: "production"
+observability:
+  enabled: true
+  namespace: monitoring
+  prometheus:
+    release: prometheus
+    chart: oci://ghcr.io/prometheus-community/charts/prometheus
+    values:
+      server:
+        retention: 7d
+  loki:
+    enabled: false
+    release: loki
+    chart: oci://ghcr.io/grafana-community/helm-charts/loki
+  grafana:
+    release: grafana
+    chart: oci://ghcr.io/grafana/helm-charts/grafana
 ```
 
-#### Resource Limits
+Set `observability_only: true` for a job that should install only this stack.
+Existing Rigel 0.3 sequences named `observability` receive the same behavior.
+The older development-branch keys such as `admin_password`, `retention`, and
+`scrape_interval` are translated to their corresponding Helm values.
 
-```yaml
-additional_k8s_params:
-  application:
-    spec:
-      template:
-        spec:
-          containers:
-            - name: "ros-app"
-              resources:
-                requests:
-                  cpu: "100m"
-                  memory: "256Mi"
-                limits:
-                  cpu: "1000m"
-                  memory: "1Gi"
-```
+Helm is invoked without a shell, waits for each enabled release, and propagates
+installation failures.
 
-## Docker Image Requirements
+## Application image
 
-Your ROS Docker image must include:
+The application image must stay running and include any executable named by the
+readiness command. The included Dockerfile is a ROS Noetic example. Its readiness
+script succeeds when it can query the configured ROS master.
 
-1. **Readiness Probe Script**: Create `/usr/local/bin/readiness_probe.sh`
-2. **Entry Point**: Executable entry point script
-3. **ROS Environment**: Proper ROS workspace setup
+The plugin creates these resources:
 
-### Example Dockerfile additions:
-
-```dockerfile
-# Copy readiness probe script
-COPY readiness_probe.sh /usr/local/bin/readiness_probe.sh
-RUN chmod +x /usr/local/bin/readiness_probe.sh
-
-# Entry point for your application
-COPY entrypoint.sh /usr/local/bin/entrypoint.sh
-RUN chmod +x /usr/local/bin/entrypoint.sh
-
-ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]
-```
-
-### Example readiness_probe.sh:
-
-```bash
-#!/bin/bash
-# Check if the ready file exists (created by init container)
-if [ -f /tmp/ready ]; then
-    exit 0
-else
-    exit 1
-fi
-```
-
-## Architecture
-
-The plugin creates the following Kubernetes resources:
-
-```
-┌─────────────────┐    ┌──────────────────┐
-│   ROS Master    │    │   Application    │
-│   Deployment    │    │   Deployment     │
-│   + Service     │    │                  │
-│                 │    │ ┌──────────────┐ │
-│ ros:noetic-core │    │ │ Init Container│ │
-│ roscore         │◄───┤ │ (readiness)   │ │
-└─────────────────┘    │ └──────────────┘ │
-                       │ ┌──────────────┐ │
-                       │ │ Main Container│ │
-                       │ │ (your app)   │ │
-                       │ └──────────────┘ │
-                       └──────────────────┘
-                              │
-                       ┌──────────────────┐
-                       │ Persistent Volume│
-                       │ Claims (PVCs)    │
-                       └──────────────────┘
-```
-
-### Key Components
-
-1. **ROS Master Service**: Provides stable endpoint for ROS communication
-2. **Init Container Pattern**: Ensures reliable readiness probe setup
-3. **Main Application Container**: Your ROS application with health checking
-4. **Persistent Storage**: Configurable volumes for data persistence
-5. **Rolling Update Support**: Zero-downtime deployments
-
-## Operations
-
-### Updating Applications
-
-```bash
-# Update your image version in Rigelfile
-# Then run update sequence
-poetry run rigel run sequence update
-```
-
-### Monitoring
-
-```bash
-# Watch pod status
-kubectl get pods -w
-
-# Check readiness probe status
-kubectl describe pod <pod-name>
-
-# View application logs
-kubectl logs -f deployment/rigel-k8s-application
-kubectl logs -f deployment/ros-master
-```
-
-### Troubleshooting
-
-#### Pod Not Ready
-
-```bash
-# Check readiness probe
-kubectl describe pod <pod-name>
-kubectl exec <pod-name> -- /usr/local/bin/readiness_probe.sh
-
-# Check init container logs
-kubectl logs <pod-name> -c readiness-init
-```
-
-#### ROS Master Connection Issues
-
-```bash
-# Verify ROS master service
-kubectl get svc ros-master
-kubectl exec deployment/rigel-k8s-application -- rostopic list
-```
-
-#### Storage Issues
-
-```bash
-# Check PVCs
-kubectl get pvc
-kubectl describe pvc logs-volume-pvc
+```text
+ros-master Service -> ros-master Deployment
+                              ^
+                              | ROS_MASTER_URI
+PVC(s) ------------> application Deployment
 ```
 
 ## Development
 
-### Project Structure
-
-```
-├── src/
-│   ├── plugin.py              # Main plugin implementation
-│   ├── models.py              # Pydantic models for configuration
-│   └── utils/
-│       └── dict_operations.py # Utility functions
-├── tests/                     # Comprehensive test suite
-├── examples/
-│   └── deploy_and_update.py   # Example deployment script
-├── app_testing/               # Testing applications and examples
-├── Dockerfile                 # Production-ready container image
-├── dockerfile_entrypoint.sh   # Container entry point
-├── readiness_probe.sh         # Readiness check script
-├── Rigelfile                  # Test configuration
-├── Rigelfile.example          # Template for users
-└── README.md                  # This file
+```bash
+poetry run ruff check src tests
+poetry run mypy src tests --pretty
+poetry run pytest
 ```
 
-### Quality Assurance
-
-This plugin maintains high code quality with:
-
-- **✅ 100% Test Success Rate**: All 11 tests passing consistently
-- **📊 76% Code Coverage**: Comprehensive test coverage across core functionality
-- **🧪 Integration Tests**: End-to-end testing with Minikube
-- **🔍 Type Safety**: Full type annotations with mypy compatibility
-- **📝 Code Quality**: Linting with ruff and proper error handling
-
-### Running Tests
+The Kubernetes integration test is opt-in:
 
 ```bash
-# Run full test suite
-poetry run pytest tests/ -v
-
-# Run with coverage report
-poetry run pytest tests/ --cov=src --cov-report=html
-
-# Run only integration tests
-poetry run pytest tests/test_integration.py -v
+RUN_K8S_INTEGRATION=1 poetry run pytest tests/test_integration.py -v
 ```
 
-### Contributing
-
-1. Fork the repository
-2. Create a feature branch
-3. Add tests for new functionality
-4. Ensure all tests pass (11/11 passing required)
-5. Maintain or improve code coverage
-6. Submit a pull request
-
-## Examples
-
-### Basic Deployment Script
-
-The `examples/deploy_and_update.py` script demonstrates how to:
-
-- Deploy a ROS application to Kubernetes
-- Perform rolling updates
-- Monitor deployment status
-- Handle common deployment scenarios
-
-```bash
-python examples/deploy_and_update.py --help
-```
-
-### Sample Applications
-
-The `app_testing/` directory contains complete examples:
-
-- **action/**: ROS action server/client example
-- **pubsub/**: ROS publisher/subscriber example
-- **service/**: ROS service with Docker Compose setup
-
-## Configuration Reference
-
-### OrchestrationPlugin Parameters
-
-| Parameter                        | Type | Default     | Description                   |
-| -------------------------------- | ---- | ----------- | ----------------------------- |
-| `deploy_ros_master`              | bool | `false`     | Deploy ROS Master service     |
-| `readiness.command`              | str  | -           | Readiness probe command       |
-| `observability.enabled`          | bool | `false`     | Enable observability stack    |
-| `rolling_update.strategy`        | str  | `"Rolling"` | Update strategy               |
-| `rolling_update.max_surge`       | int  | `1`         | Max pods above desired        |
-| `rolling_update.max_unavailable` | int  | `0`         | Max unavailable pods          |
-| `persistent_storage.volumes`     | list | `[]`        | Volume configurations         |
-| `distributed.enabled`            | bool | `false`     | Enable distributed deployment |
-
-### Example Complete Configuration
-
-See `Rigelfile.example` for a complete configuration template.
+It expects an already configured cluster. CI creates a kind cluster before
+enabling it.

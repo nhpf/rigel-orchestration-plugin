@@ -1,6 +1,4 @@
 #!/bin/bash
-if [ -f /tmp/ready ]; then
-    exit 0
-else
-    exit 1
-fi
+set -e
+
+timeout 5 rostopic list >/dev/null 2>&1

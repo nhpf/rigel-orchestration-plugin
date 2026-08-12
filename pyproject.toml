@@ -1,19 +1,26 @@
-[tool.poetry]
-name = "src"
-version = "0.1.0"
+[project]
+name = "rigel-kubernetes-orchestration"
+version = "0.2.0"
 description = "An orchestration tool that enables Rigel to manage the deployment of applications with Kubernetes."
-authors = ["Nicholas Hopf <nicholas.hopf@inesctec.pt>"]
+authors = [{ name = "Nicholas Hopf", email = "nicholas.hopf@inesctec.pt" }]
 readme = "README.md"
+requires-python = ">=3.10,<4.0"
+dependencies = [
+    "pydantic<2.0",
+    "kubernetes>=31.0.0,<32.0.0",
+    "PyYAML>=6.0.2,<7.0.0",
+    "Jinja2>=3.1.4,<4.0.0",
+]
+
+[project.scripts]
+rigel-k8s = "src.cli:main"
+
+[tool.poetry]
+packages = [{ include = "src" }]
 
 [build-system]
 requires = ["poetry-core>=2.0.0,<3.0.0"]
 build-backend = "poetry.core.masonry.api"
-
-[tool.poetry.dependencies]
-python = ">=3.10,<4.0"
-pydantic = "<2.0"
-kubernetes = ">=31.0.0,<32.0.0"
-rigel = { git = "https://github.com/rigel-ros/rigel.git", rev = "develop", python = ">=3.10,<4.0" }
 
 [tool.poetry.group.dev.dependencies]
 pytest = "^8.3.4"
@@ -30,11 +37,17 @@ exclude = ["venv", ".venv", "build", "dist"]
 
 [tool.ruff.lint.extend-per-file-ignores]
 "tests/**/*.py" = [
+    "D", # Test names describe behavior; per-test docstrings add no value
     "S101", # asserts allowed in tests
     "ARG", # Unused function args (fixtures)
     "FBT", # Don't care about booleans as positional arguments in tests
     "PLR2004", # Magic value used in comparison
     "S311", # Standard pseudo-random generators are not suitable for cryptographic purposes
+]
+"src/compat.py" = [
+    "ANN401", # Compatibility boundary intentionally accepts Rigel's dynamically typed objects
+    "D102",
+    "D107",
 ]
 "app_testing/**/*.py" = [
     "ALL",
@@ -45,7 +58,9 @@ python_version = "3.13"
 check_untyped_defs = true
 ignore_missing_imports = true
 strict_optional = true
+disable_error_code = ["import-untyped"]
 
 [tool.pytest.ini_options]
 minversion = "8.3"
 addopts = "--cov=src --cov-report=term-missing"
+markers = ["integration: requires a reachable Kubernetes cluster"]

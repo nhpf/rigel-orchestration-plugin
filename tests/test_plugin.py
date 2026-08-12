@@ -1,186 +1,228 @@
-from collections.abc import Iterator
-from unittest.mock import ANY, MagicMock, patch
+import subprocess
+from types import SimpleNamespace
+from unittest.mock import MagicMock
 
 import pytest
+from kubernetes.client import ApiException
 
-# Import your plugin code
-from src.plugin import DEPLOYMENT_NAME, OrchestrationPlugin
-
-
-@pytest.fixture
-def mock_k8s_apis() -> Iterator[tuple[MagicMock, MagicMock]]:
-    """Fixture to patch the Kubernetes clients in your plugin."""
-    with patch("src.plugin.AppsV1Api") as mock_apps, patch("src.plugin.CoreV1Api") as mock_core:
-        yield mock_apps, mock_core
+from src.plugin import OrchestrationPlugin
 
 
 @pytest.fixture
-def plugin_instance(mock_k8s_apis: tuple[MagicMock, MagicMock]) -> OrchestrationPlugin:
-    """Return an instance of OrchestrationPlugin with minimal config."""
-    raw_data = {
-        "orchestration": {
-            "deploy_ros_master": True,
-            "readiness": {"command": "/usr/local/bin/readiness_probe.sh"},
-            "observability": {"enabled": True},
-            "rolling_update": {"strategy": "Rolling", "max_surge": 1, "max_unavailable": 0},
-            "distributed": {"enabled": True, "default_to_remote": True, "force_local_flag": False},
-            "persistent_storage": {
-                "volumes": [
-                    {"name": "logs-volume", "size": "1Gi", "storage_class": "standard"},
-                ],
-            },
-            "additional_k8s_params": {},
-        },
-    }
+def apis() -> tuple[MagicMock, MagicMock]:
+    return MagicMock(), MagicMock()
 
-    # Create a dummy plugin instance
-    from rigel.models.application import Application
 
-    application = Application(distro="noetic")
-
-    # providers_data & shared_data can be empty dict
+@pytest.fixture
+def plugin(apis: tuple[MagicMock, MagicMock]) -> OrchestrationPlugin:
+    apps_api, core_api = apis
     return OrchestrationPlugin(
-        raw_data=raw_data,
-        global_data={},
-        application=application,
-        providers_data={},
-        shared_data={},
-    )
-
-
-def test_plugin_init(plugin_instance: OrchestrationPlugin) -> None:
-    """Check if the plugin is initialized correctly."""
-    assert plugin_instance.model.orchestration.deploy_ros_master is True
-    assert plugin_instance.application.distro == "noetic"
-
-
-def test_deploy_ros_master(plugin_instance: OrchestrationPlugin, mock_k8s_apis: tuple[MagicMock, MagicMock]) -> None:
-    """Ensure job_deploy_ros_master calls the create_namespaced_deployment if not found."""
-    mock_apps_api, mock_core_api = mock_k8s_apis  # unpack the mocks
-
-    # By default, read_namespaced_deployment is not set up, so let's simulate a 404
-    instance = mock_apps_api.return_value
-
-    from kubernetes.client.rest import ApiException as K8sApiException
-
-    instance.read_namespaced_deployment.side_effect = K8sApiException(status=404, reason="Not Found")
-
-    plugin_instance.job_deploy_ros_master()
-
-    # We expect create_namespaced_deployment to have been called once
-    instance.create_namespaced_deployment.assert_called_once()
-
-
-def test_deploy_application(plugin_instance: OrchestrationPlugin, mock_k8s_apis: tuple[MagicMock, MagicMock]) -> None:
-    """Check if job_deploy_application patches or creates the deployment properly."""
-    mock_apps_api, _ = mock_k8s_apis
-    instance = mock_apps_api.return_value
-
-    # Simulate that reading the deployment fails => triggers a CREATE
-    from kubernetes.client.rest import ApiException as K8sApiException
-
-    instance.read_namespaced_deployment.side_effect = K8sApiException(status=404, reason="Not Found")
-
-    plugin_instance.job_deploy_application()
-    instance.create_namespaced_deployment.assert_called_once()
-
-    # Now let's simulate a found deployment => triggers a PATCH
-    instance.create_namespaced_deployment.reset_mock()
-    instance.read_namespaced_deployment.side_effect = None  # no error
-    plugin_instance.job_deploy_application()
-    instance.patch_namespaced_deployment.assert_called_once_with(
-        DEPLOYMENT_NAME,
-        "default",
-        ANY,
-    )
-
-
-def test_check_readiness(plugin_instance: OrchestrationPlugin, mock_k8s_apis: tuple[MagicMock, MagicMock]) -> None:
-    """Validate that readiness returns True if the pods are Running and container ready."""
-    mock_apps_api, mock_core_api = mock_k8s_apis
-    core_instance = mock_core_api.return_value
-
-    # Mock a single Pod in 'Running' phase with container ready
-    fake_pod = MagicMock()
-    fake_pod.status.phase = "Running"
-    container_status = MagicMock()
-    container_status.ready = True
-    fake_pod.status.container_statuses = [container_status]
-    core_instance.list_namespaced_pod.return_value.items = [fake_pod]
-
-    is_ready = plugin_instance.job_check_readiness()
-    assert is_ready is True
-
-    # Now test case: not ready
-    container_status.ready = False
-    is_ready = plugin_instance.job_check_readiness()
-    assert is_ready is False
-
-    # etc.
-
-
-@pytest.mark.parametrize("observability_enabled", [True, False])
-def test_configure_observability(
-    plugin_instance: OrchestrationPlugin, mock_k8s_apis: tuple[MagicMock, MagicMock], observability_enabled: bool
-) -> None:
-    """Check logs or skip logic for job_configure_observability."""
-    if plugin_instance.orch.observability is None:
-        # Create a default ObservabilityConfig or handle it as needed
-        from src.models import ObservabilityConfig
-
-        plugin_instance.orch.observability = ObservabilityConfig()
-
-    plugin_instance.orch.observability.enabled = observability_enabled
-    # Just ensure it doesn't crash
-    plugin_instance.job_configure_observability()
-
-    # Could assert logger output, or that we do some create_deployment calls if fully implemented
-
-
-def test_rolling_update(plugin_instance: OrchestrationPlugin, mock_k8s_apis: tuple[MagicMock, MagicMock]) -> None:
-    """Ensure rolling update patches the deployment strategy after readiness."""
-    mock_apps_api, mock_core_api = mock_k8s_apis
-
-    with patch.object(plugin_instance, "job_check_readiness", return_value=True):
-        plugin_instance.job_rolling_update()
-
-    mock_apps_api.return_value.patch_namespaced_deployment.assert_called_once_with(
-        DEPLOYMENT_NAME,
-        "default",
-        {
-            "spec": {
-                "strategy": {
-                    "type": "RollingUpdate",
-                    "rollingUpdate": {
-                        "maxSurge": 1,
-                        "maxUnavailable": 0,
-                    },
+        raw_data={
+            "orchestration": {
+                "deploy_ros_master": True,
+                "application_image": "registry.example/robot:v1",
+                "readiness": {"command": "/usr/local/bin/readiness_probe.sh", "timeout_seconds": 0},
+                "rolling_update": {"max_surge": 1, "max_unavailable": 0},
+                "distributed": {"enabled": True, "default_to_remote": True},
+                "persistent_storage": {
+                    "volumes": [{"name": "logs", "size": "1Gi", "storage_class": "standard"}],
                 },
-            },
-        },
-    )
-
-
-def test_distributed_deployment(
-    plugin_instance: OrchestrationPlugin, mock_k8s_apis: tuple[MagicMock, MagicMock]
-) -> None:
-    """Check if nodeSelector patch is applied for distributed deployment."""
-    mock_apps_api, _ = mock_k8s_apis
-    instance = mock_apps_api.return_value
-
-    plugin_instance.job_distributed_deployment()
-    instance.patch_namespaced_deployment.assert_called_once_with(
-        DEPLOYMENT_NAME,
-        "default",
-        {
-            "spec": {
-                "template": {
-                    "spec": {
-                        "nodeSelector": {
-                            "deploymentType": "remote",
+                "additional_k8s_params": {
+                    "application": {
+                        "spec": {
+                            "template": {
+                                "spec": {
+                                    "containers": [
+                                        {
+                                            "name": "ros-app",
+                                            "env": [{"name": "CUSTOM_ENV", "value": "production"}],
+                                        },
+                                    ],
+                                },
+                            },
                         },
                     },
                 },
             },
         },
+        global_data={},
+        application=SimpleNamespace(distro="noetic"),
+        providers_data={},
+        apps_api=apps_api,
+        core_api=core_api,
     )
+
+
+def test_init_does_not_contact_kubernetes(plugin: OrchestrationPlugin, apis: tuple[MagicMock, MagicMock]) -> None:
+    assert plugin.application.distro == "noetic"
+    assert plugin.orch.application_image == "registry.example/robot:v1"
+    assert not apis[0].method_calls
+    assert not apis[1].method_calls
+
+
+def test_ros_master_is_created_with_service_and_correct_image(
+    plugin: OrchestrationPlugin,
+    apis: tuple[MagicMock, MagicMock],
+) -> None:
+    apps_api, core_api = apis
+    core_api.read_namespaced_service.side_effect = ApiException(status=404)
+    apps_api.read_namespaced_deployment.side_effect = ApiException(status=404)
+
+    plugin.job_deploy_ros_master()
+
+    core_api.create_namespaced_service.assert_called_once()
+    apps_api.create_namespaced_deployment.assert_called_once()
+    body = apps_api.create_namespaced_deployment.call_args.kwargs["body"]
+    container = body["spec"]["template"]["spec"]["containers"][0]
+    assert container["image"] == "ros:noetic-ros-core"
+    assert container["args"] == ["roscore"]
+
+
+def test_existing_resources_are_patched(plugin: OrchestrationPlugin, apis: tuple[MagicMock, MagicMock]) -> None:
+    apps_api, core_api = apis
+
+    plugin.job_deploy_ros_master()
+    plugin.job_deploy_application()
+
+    core_api.patch_namespaced_service.assert_called_once()
+    assert apps_api.patch_namespaced_deployment.call_count == 2
+
+
+def test_non_404_api_errors_are_not_swallowed(plugin: OrchestrationPlugin, apis: tuple[MagicMock, MagicMock]) -> None:
+    _, core_api = apis
+    core_api.read_namespaced_service.side_effect = ApiException(status=403)
+
+    with pytest.raises(ApiException):
+        plugin.job_deploy_ros_master()
+
+
+def test_application_manifest_preserves_defaults_when_overridden(plugin: OrchestrationPlugin) -> None:
+    manifest = plugin.build_application_deployment()
+    spec = manifest["spec"]
+    pod_spec = spec["template"]["spec"]
+    container = pod_spec["containers"][0]
+
+    assert container["name"] == "ros-app"
+    assert container["image"] == "registry.example/robot:v1"
+    assert container["readinessProbe"]["exec"]["command"] == ["/usr/local/bin/readiness_probe.sh"]
+    assert {item["name"] for item in container["env"]} == {"ROS_MASTER_URI", "CUSTOM_ENV"}
+    assert container["volumeMounts"] == [{"name": "logs", "mountPath": "/persistent/logs"}]
+    assert pod_spec["volumes"][0]["persistentVolumeClaim"]["claimName"] == "logs-pvc"
+    assert pod_spec["nodeSelector"] == {"deploymentType": "remote"}
+    assert spec["strategy"]["type"] == "RollingUpdate"
+
+
+def test_dynamic_storage_creates_only_a_claim(plugin: OrchestrationPlugin, apis: tuple[MagicMock, MagicMock]) -> None:
+    _, core_api = apis
+    core_api.read_namespaced_persistent_volume_claim.side_effect = ApiException(status=404)
+
+    plugin.job_create_persistent_storage()
+
+    core_api.create_namespaced_persistent_volume_claim.assert_called_once()
+    core_api.create_persistent_volume.assert_not_called()
+    body = core_api.create_namespaced_persistent_volume_claim.call_args.kwargs["body"]
+    assert body["spec"]["storageClassName"] == "standard"
+    assert "volumeName" not in body["spec"]
+
+
+def test_readiness_requires_pods_statuses_and_ready_containers(
+    plugin: OrchestrationPlugin,
+    apis: tuple[MagicMock, MagicMock],
+) -> None:
+    _, core_api = apis
+    core_api.list_namespaced_pod.return_value.items = []
+    assert plugin.job_check_readiness() is False
+
+    pod = SimpleNamespace(status=SimpleNamespace(phase="Running", container_statuses=[]))
+    core_api.list_namespaced_pod.return_value.items = [pod]
+    assert plugin.job_check_readiness() is False
+
+    pod.status.container_statuses = [SimpleNamespace(ready=True)]
+    assert plugin.job_check_readiness() is True
+    core_api.list_namespaced_pod.assert_called_with(
+        "default",
+        label_selector="app.kubernetes.io/name=rigel-k8s-application",
+    )
+
+
+def test_rolling_and_distributed_patches(plugin: OrchestrationPlugin, apis: tuple[MagicMock, MagicMock]) -> None:
+    apps_api, _ = apis
+
+    plugin.job_rolling_update()
+    plugin.job_distributed_deployment()
+
+    assert apps_api.patch_namespaced_deployment.call_args_list[0].args[2] == {
+        "spec": {
+            "strategy": {
+                "type": "RollingUpdate",
+                "rollingUpdate": {"maxSurge": 1, "maxUnavailable": 0},
+            },
+        },
+    }
+    assert apps_api.patch_namespaced_deployment.call_args_list[1].args[2] == {
+        "spec": {"template": {"spec": {"nodeSelector": {"deploymentType": "remote"}}}},
+    }
+
+
+def test_observability_runs_helm_without_a_shell(apis: tuple[MagicMock, MagicMock]) -> None:
+    calls: list[list[str]] = []
+
+    def runner(command: list[str], *, check: bool) -> subprocess.CompletedProcess[str]:
+        assert check is True
+        calls.append(command)
+        return subprocess.CompletedProcess(command, 0)
+
+    plugin = OrchestrationPlugin(
+        raw_data={
+            "orchestration": {
+                "observability": {
+                    "enabled": True,
+                    "prometheus": {"release": "prom", "chart": "example/prom", "values": {"server": {}}},
+                    "loki": {"enabled": False, "release": "loki", "chart": "example/loki"},
+                    "grafana": {"release": "grafana", "chart": "example/grafana"},
+                },
+            },
+        },
+        global_data={},
+        application=SimpleNamespace(distro="noetic"),
+        providers_data={},
+        apps_api=apis[0],
+        core_api=apis[1],
+        command_runner=runner,
+    )
+
+    plugin.job_configure_observability()
+
+    assert len(calls) == 2
+    assert calls[0][:5] == ["helm", "upgrade", "--install", "prom", "example/prom"]
+    assert all(isinstance(command, list) for command in calls)
+
+
+def test_development_branch_observability_config_is_translated(apis: tuple[MagicMock, MagicMock]) -> None:
+    plugin = OrchestrationPlugin(
+        raw_data={
+            "orchestration": {
+                "observability": {
+                    "enabled": True,
+                    "grafana": {"enabled": True, "admin_password": "secret", "service_type": "NodePort"},
+                    "prometheus": {"enabled": True, "retention": "7d", "scrape_interval": "10s"},
+                    "loki": {"enabled": True, "retention": "7d", "persistence": {"enabled": True, "size": "5Gi"}},
+                },
+            },
+        },
+        global_data={},
+        application=SimpleNamespace(distro="noetic"),
+        providers_data={},
+        apps_api=apis[0],
+        core_api=apis[1],
+    )
+
+    observability = plugin.orch.observability
+    assert observability is not None
+    assert observability.grafana.values["adminPassword"] == "secret"
+    assert observability.grafana.values["service"]["type"] == "NodePort"
+    assert observability.prometheus.values["server"]["retention"] == "7d"
+    assert observability.prometheus.values["server"]["global"]["scrape_interval"] == "10s"
+    assert observability.loki.chart == "oci://ghcr.io/grafana-community/helm-charts/loki"
+    assert observability.loki.values["deploymentMode"] == "Monolithic"
+    assert observability.loki.values["loki"]["limits_config"]["retention_period"] == "7d"

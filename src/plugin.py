@@ -1,483 +1,435 @@
+"""Kubernetes orchestration for ROS applications."""
+
 from __future__ import annotations
 
+import shlex
+import shutil
+import subprocess
+import tempfile
 import time
-from typing import TYPE_CHECKING, Any
+from pathlib import Path
+from typing import TYPE_CHECKING, Any, Protocol, cast
 
-# Kubernetes client library
+import yaml
 from kubernetes import config
 from kubernetes.client import ApiException, AppsV1Api, CoreV1Api
+from kubernetes.config.config_exception import ConfigException
 
-# Rigel imports
-from rigel.loggers import get_logger
-from rigel.models.builder import ModelBuilder
-
-if TYPE_CHECKING:
-    from rigel.models.application import Application
-    from rigel.models.plugin import PluginRawData
-    from rigel.models.rigelfile import RigelfileGlobalData
-
-# Import our Pydantic models
-from rigel.plugins import Plugin as PluginBase
-
-from .models import KubernetesOrchestrationModel, OrchestrationPluginModel
+from .compat import ModelBuilder, PluginBase, get_logger
+from .models import HelmComponentConfig, KubernetesOrchestrationModel, OrchestrationPluginModel, VolumeConfig
 from .utils.dict_operations import deep_merge
 
+if TYPE_CHECKING:
+    from collections.abc import Callable, Mapping
+
 DEPLOYMENT_NAME = "rigel-k8s-application"
-UNAVAILABLE_STATUS = 404
+NOT_FOUND_STATUS = 404
 LOGGER = get_logger()
 
 
+class ApplicationLike(Protocol):
+    """Application data required from Rigel or the standalone CLI."""
+
+    @property
+    def distro(self) -> str:
+        """Target ROS distribution."""
+        ...
+
+
 class OrchestrationPlugin(PluginBase):
-    """A Rigel plugin that orchestrates a ROS application in Kubernetes."""
+    """Deploy a ROS application and its supporting resources to Kubernetes."""
 
-    def __init__(
+    def __init__(  # noqa: PLR0913 - preserves Rigel's required constructor and supports dependency injection
         self,
-        raw_data: PluginRawData,
-        global_data: RigelfileGlobalData,
-        application: Application,
-        providers_data: dict[str, Any],
-        shared_data: dict[str, Any] | None = None,
+        raw_data: Mapping[str, Any],
+        global_data: Mapping[str, Any] | None,
+        application: ApplicationLike,
+        providers_data: Mapping[str, Any] | None,
+        shared_data: Mapping[str, Any] | None = None,
+        *,
+        apps_api: AppsV1Api | None = None,
+        core_api: CoreV1Api | None = None,
+        command_runner: Callable[..., subprocess.CompletedProcess[Any]] = subprocess.run,
     ) -> None:
-        """Create a new plugin instance."""
-        super().__init__(raw_data, global_data, application, providers_data, shared_data or {})
+        """Validate configuration without connecting to a cluster.
 
-        # Build and validate user data against our Pydantic model.
+        Kubernetes clients can be injected for tests and embedding. Otherwise they
+        are initialized lazily by :meth:`setup`.
+        """
+        base_init = cast("Callable[..., None]", super().__init__)
+        base_init(
+            raw_data,
+            global_data,
+            application,
+            providers_data,
+            shared_data or {},
+        )
         self.model: OrchestrationPluginModel = ModelBuilder(OrchestrationPluginModel).build([], self.raw_data)
-
-        # For convenience, store a reference to the orchestration data
         self.orch: KubernetesOrchestrationModel = self.model.orchestration
+        self._apps_api = apps_api
+        self._core_api = core_api
+        self._command_runner = command_runner
 
-        # Set up a K8s client (in-cluster or local). For local dev, ensure your kubeconfig is present.
-        # In many real cases, you'd do this in 'setup()', but we can do it here too.
+    @property
+    def namespace(self) -> str:
+        """Namespace containing the ROS application."""
+        return self.orch.namespace
+
+    @property
+    def deployment_name(self) -> str:
+        """Name of the main application Deployment."""
+        return self.orch.deployment_name
+
+    def setup(self) -> None:
+        """Initialize Kubernetes clients from local or in-cluster credentials."""
+        if self._apps_api is not None and self._core_api is not None:
+            return
+
         try:
-            config.load_kube_config()  # If running locally
-        except Exception as e:  # noqa: BLE001
-            LOGGER.warning(f"Error loading kubeconfig: {e}")
-            # If in-cluster, you could do config.load_incluster_config()
-            # or handle exceptions gracefully.
-            config.load_incluster_config()
+            config.load_kube_config()
+        except ConfigException as local_error:
+            try:
+                config.load_incluster_config()
+            except ConfigException as cluster_error:
+                msg = "No Kubernetes configuration found (tried kubeconfig and in-cluster credentials)"
+                raise RuntimeError(msg) from cluster_error
+            LOGGER.debug("Local kubeconfig unavailable: %s", local_error)
 
         self._apps_api = AppsV1Api()
         self._core_api = CoreV1Api()
 
-        LOGGER.info("Initialized OrchestrationPlugin with validated schema.")
+    def _clients(self) -> tuple[AppsV1Api, CoreV1Api]:
+        self.setup()
+        if self._apps_api is None or self._core_api is None:  # defensive; setup either creates both or raises
+            msg = "Kubernetes clients were not initialized"
+            raise RuntimeError(msg)
+        return self._apps_api, self._core_api
 
-    # ----------------------------------------------------------------
-    # Jobs
-    # ----------------------------------------------------------------
-
-    def job_deploy_ros_master(self) -> None:
-        """Deploy or update a ROS master node as a K8s Deployment."""
-        deployment_name = "ros-master"
-        namespace = "default"
-
-        # First, create or update the Service
-        service_body = {
+    def build_ros_master_service(self) -> dict[str, Any]:
+        """Build the ROS master Service manifest."""
+        return {
             "apiVersion": "v1",
             "kind": "Service",
-            "metadata": {"name": "ros-master"},
+            "metadata": {"name": "ros-master", "namespace": self.namespace},
             "spec": {
-                "selector": {"app": "ros-master"},
-                "ports": [{"port": 11311, "targetPort": 11311, "protocol": "TCP"}],
+                "selector": {"app.kubernetes.io/name": "ros-master"},
+                "ports": [{"name": "ros", "port": 11311, "targetPort": 11311, "protocol": "TCP"}],
             },
         }
 
-        try:
-            self._core_api.read_namespaced_service("ros-master", namespace)
-            LOGGER.info("ros-master service already exists.")
-        except ApiException as e:
-            if e.status == UNAVAILABLE_STATUS:
-                self._core_api.create_namespaced_service(namespace=namespace, body=service_body)
-                LOGGER.info("Created ros-master service.")
-            else:
-                LOGGER.warning(f"Error with ros-master service: {e}")
-
-        # Then handle the deployment
-        try:
-            self._apps_api.read_namespaced_deployment(deployment_name, namespace)
-            LOGGER.info("ros-master is already deployed; skipping creation.")
-            # LOGGER.info("ros-master is already deployed; patching it.")  # noqa: ERA001
-            # self._apps_api.patch_namespaced_deployment(deployment_name, namespace, final_depl)  # noqa: ERA001
-        except ApiException as e:
-            if e.status == UNAVAILABLE_STATUS:
-                # Create a new deployment
-                LOGGER.info("Deploying ros-master in K8s.")
-                ros_master_depl = {
-                    "apiVersion": "apps/v1",
-                    "kind": "Deployment",
-                    "metadata": {"name": deployment_name},
-                    "spec": {
-                        "replicas": 1,
-                        "selector": {"matchLabels": {"app": "ros-master"}},
-                        "template": {
-                            "metadata": {"labels": {"app": "ros-master"}},
-                            "spec": {
-                                "containers": [
-                                    {
-                                        "name": "ros-master-container",
-                                        "image": "nhopf/turtle-rigel:1.0.4",
-                                        "ports": [{"containerPort": 11311}],
-                                        "env": [
-                                            {"name": "ROS_HOSTNAME", "value": "ros-master"},
-                                            {"name": "ROS_MASTER_URI", "value": "http://ros-master:11311"},
-                                        ],
-                                        # Example readiness probe if desired:
-                                        # "readinessProbe": {  # noqa: ERA001
-                                        #     "exec": {  # noqa: ERA001
-                                        #     "command": ["/bin/sh", "-c", "/opt/ros/noetic/scripts/readiness_probe.sh"]
-                                        #     },
-                                        #     "initialDelaySeconds": 5,  # noqa: ERA001
-                                        #     "periodSeconds": 5
-                                        # },
-                                    },
-                                ],
-                            },
-                        },
-                    },
-                }
-                # Merge any additional user overrides for ROS master if needed
-                final_depl = deep_merge(ros_master_depl, self.orch.additional_k8s_params.get("ros_master", {}))
-                self._apps_api.create_namespaced_deployment(namespace=namespace, body=final_depl)
-                LOGGER.info("ros-master deployed successfully.")
-            else:
-                LOGGER.warning(f"Error reading ros-master deployment: {e}")
-
-    def job_create_persistent_storage(self) -> None:
-        """Create or update the required PVs and PVCs for the user-specified volumes."""
-        if not self.orch.persistent_storage:
-            return
-
-        for vol in self.orch.persistent_storage.volumes:
-            # 1. Create PV
-            pv_body = {
-                "apiVersion": "v1",
-                "kind": "PersistentVolume",
-                "metadata": {"name": f"{vol.name}-pv"},
-                "spec": {
-                    "capacity": {"storage": vol.size},
-                    "accessModes": ["ReadWriteOnce"],
-                    "storageClassName": vol.storage_class,
-                    "hostPath": {
-                        "path": f"/mnt/data/{vol.name}",  # Example host path
-                    },
-                },
-            }
-            # Attempt creation or skip if it exists
-            try:
-                self._core_api.read_persistent_volume(name=f"{vol.name}-pv")
-                LOGGER.info(f"PersistentVolume {vol.name}-pv already exists; skipping creation.")
-            except ApiException as e:
-                if e.status == UNAVAILABLE_STATUS:
-                    self._core_api.create_persistent_volume(body=pv_body)
-                    LOGGER.info(f"Created PersistentVolume '{vol.name}-pv'.")
-                else:
-                    LOGGER.warning(f"Error reading PV for {vol.name}: {e}")
-
-            # 2. Create PVC in default namespace
-            pvc_body = {
-                "apiVersion": "v1",
-                "kind": "PersistentVolumeClaim",
-                "metadata": {"name": f"{vol.name}-pvc"},
-                "spec": {
-                    "accessModes": ["ReadWriteOnce"],
-                    "resources": {"requests": {"storage": vol.size}},
-                    "storageClassName": vol.storage_class,
-                },
-            }
-            try:
-                self._core_api.read_namespaced_persistent_volume_claim(f"{vol.name}-pvc", "default")
-                LOGGER.info(f"PVC {vol.name}-pvc already exists; skipping creation.")
-            except ApiException as e:
-                if e.status == UNAVAILABLE_STATUS:
-                    self._core_api.create_namespaced_persistent_volume_claim(namespace="default", body=pvc_body)
-                    LOGGER.info(f"Created PVC '{vol.name}-pvc'.")
-                else:
-                    LOGGER.warning(f"Error reading PVC for {vol.name}: {e}")
-
-    def job_deploy_application(self) -> None:
-        """Deploy or update a ROS application deployment.
-
-        This method creates a K8s deployment for the main application.
-        The deployment spec can be customized/overridden with additional parameters
-        from self.application or additional plugin data.
-        """
-        namespace = "default"
-
-        # Build volume mounts and volumes if persistent storage is configured
-        volume_mounts = []
-        volumes = []
-
-        if self.orch.persistent_storage and self.orch.persistent_storage.volumes:
-            for vol in self.orch.persistent_storage.volumes:
-                volume_mounts.append({"name": vol.name, "mountPath": f"/persistent_{vol.name.replace('-', '_')}"})
-                volumes.append({"name": vol.name, "persistentVolumeClaim": {"claimName": f"{vol.name}-pvc"}})
-
-        # Minimal base deployment spec
-        # Default container spec - image will be overridden by additional_k8s_params
-        container_spec = {
-            "name": "ros-app",
-            "image": "ros:noetic-ros-core",  # Default - will be overridden by Rigelfile
-            "ports": [{"containerPort": 8080}],
-            "command": ["/home/rigeluser/robot-entrypoint.sh"],
-            "args": ["rostopic", "pub", "/hello", "std_msgs/String", "Hello from K8s", "-r", "1"],
-            "env": [{"name": "ROS_MASTER_URI", "value": "http://ros-master:11311"}],
-            "volumeMounts": [{"name": "tmp-volume", "mountPath": "/tmp"}],
-        }  # Add volume mounts if available
-        if volume_mounts:
-            container_spec["volumeMounts"].extend(volume_mounts)
-
-        base_deployment = {
+    def build_ros_master_deployment(self) -> dict[str, Any]:
+        """Build the ROS master Deployment manifest."""
+        distro = self.application.distro
+        base = {
             "apiVersion": "apps/v1",
             "kind": "Deployment",
-            "metadata": {"name": DEPLOYMENT_NAME},
+            "metadata": {"name": "ros-master", "namespace": self.namespace},
             "spec": {
                 "replicas": 1,
-                "selector": {"matchLabels": {"app": DEPLOYMENT_NAME}},
+                "selector": {"matchLabels": {"app.kubernetes.io/name": "ros-master"}},
                 "template": {
-                    "metadata": {"labels": {"app": DEPLOYMENT_NAME}},
+                    "metadata": {"labels": {"app.kubernetes.io/name": "ros-master"}},
                     "spec": {
-                        "initContainers": [
+                        "containers": [
                             {
-                                "name": "readiness-init",
-                                "image": "busybox:latest",
-                                "command": ["/bin/sh", "-c", "touch /tmp/ready && echo 'Ready file created'"],
-                                "volumeMounts": [{"name": "tmp-volume", "mountPath": "/tmp"}],
-                            }
+                                "name": "ros-master-container",
+                                "image": self.orch.ros_master_image or f"ros:{distro}-ros-core",
+                                "command": ["/ros_entrypoint.sh"],
+                                "args": ["roscore"],
+                                "ports": [{"name": "ros", "containerPort": 11311}],
+                                "env": [
+                                    {"name": "ROS_HOSTNAME", "value": "ros-master"},
+                                    {"name": "ROS_MASTER_URI", "value": "http://ros-master:11311"},
+                                ],
+                            },
                         ],
-                        "containers": [container_spec],
                     },
                 },
             },
         }
+        return deep_merge(base, self.orch.additional_k8s_params.get("ros_master", {}))
 
-        # Add additional volumes if available
-        base_volumes = [{"name": "tmp-volume", "emptyDir": {}}]
+    def _rolling_strategy(self) -> dict[str, Any] | None:
+        rolling = self.orch.rolling_update
+        if rolling is None:
+            return None
+        if rolling.strategy.lower() == "recreate":
+            return {"type": "Recreate"}
+        return {
+            "type": "RollingUpdate",
+            "rollingUpdate": {"maxSurge": rolling.max_surge, "maxUnavailable": rolling.max_unavailable},
+        }
+
+    def build_application_deployment(self) -> dict[str, Any]:
+        """Build the application Deployment, including storage and health settings."""
+        labels = {"app.kubernetes.io/name": self.deployment_name}
+        container: dict[str, Any] = {
+            "name": "ros-app",
+            "image": self.orch.application_image or f"ros:{self.application.distro}-ros-core",
+        }
+
+        if self.orch.deploy_ros_master:
+            container["env"] = [{"name": "ROS_MASTER_URI", "value": "http://ros-master:11311"}]
+
+        volumes: list[dict[str, Any]] = []
+        mounts: list[dict[str, Any]] = []
+        if self.orch.persistent_storage:
+            for volume in self.orch.persistent_storage.volumes:
+                volumes.append(
+                    {"name": volume.name, "persistentVolumeClaim": {"claimName": f"{volume.name}-pvc"}},
+                )
+                mounts.append(
+                    {
+                        "name": volume.name,
+                        "mountPath": volume.mount_path or f"/persistent/{volume.name}",
+                    },
+                )
+        if mounts:
+            container["volumeMounts"] = mounts
+
+        if self.orch.readiness:
+            readiness = self.orch.readiness
+            container["readinessProbe"] = {
+                "exec": {"command": shlex.split(readiness.command)},
+                "initialDelaySeconds": readiness.initial_delay_seconds,
+                "periodSeconds": readiness.period_seconds,
+            }
+
+        base: dict[str, Any] = {
+            "apiVersion": "apps/v1",
+            "kind": "Deployment",
+            "metadata": {"name": self.deployment_name, "namespace": self.namespace},
+            "spec": {
+                "replicas": 1,
+                "selector": {"matchLabels": labels},
+                "template": {"metadata": {"labels": labels}, "spec": {"containers": [container]}},
+            },
+        }
         if volumes:
-            base_volumes.extend(volumes)
+            base["spec"]["template"]["spec"]["volumes"] = volumes
+        strategy = self._rolling_strategy()
+        if strategy:
+            base["spec"]["strategy"] = strategy
 
-        base_deployment["spec"]["template"]["spec"]["volumes"] = base_volumes
+        distributed = self.orch.distributed
+        if distributed and distributed.enabled and distributed.default_to_remote and not distributed.force_local_flag:
+            base["spec"]["template"]["spec"]["nodeSelector"] = {"deploymentType": "remote"}
 
-        # Merge user-specified additional_k8s_params for the main app if any
-        additional_params = self.orch.additional_k8s_params.get("application", {})
-        final_deployment = deep_merge(base_deployment, additional_params)
+        return deep_merge(base, self.orch.additional_k8s_params.get("application", {}))
 
-        # Ensure tmp-volume is always present in final deployment
-        final_volumes = final_deployment["spec"]["template"]["spec"].get("volumes", [])
-        tmp_volume_exists = any(vol.get("name") == "tmp-volume" for vol in final_volumes)
-        if not tmp_volume_exists:
-            final_volumes.insert(0, {"name": "tmp-volume", "emptyDir": {}})
-            final_deployment["spec"]["template"]["spec"]["volumes"] = final_volumes
-
-        # Ensure tmp-volume mount is present in main container
-        main_container = final_deployment["spec"]["template"]["spec"]["containers"][0]
-        main_volume_mounts = main_container.get("volumeMounts", [])
-        tmp_mount_exists = any(mount.get("name") == "tmp-volume" for mount in main_volume_mounts)
-        if not tmp_mount_exists:
-            main_volume_mounts.insert(0, {"name": "tmp-volume", "mountPath": "/tmp"})
-            main_container["volumeMounts"] = main_volume_mounts
-
+    def _upsert_deployment(self, name: str, body: dict[str, Any]) -> None:
+        apps_api, _ = self._clients()
         try:
-            self._apps_api.read_namespaced_deployment(DEPLOYMENT_NAME, namespace)
-            # Patch or update
-            self._apps_api.patch_namespaced_deployment(DEPLOYMENT_NAME, namespace, final_deployment)
-            LOGGER.info(f"Patched existing application deployment '{DEPLOYMENT_NAME}'.")
-        except ApiException as e:
-            if e.status == UNAVAILABLE_STATUS:
-                # Create new
-                self._apps_api.create_namespaced_deployment(namespace=namespace, body=final_deployment)
-                LOGGER.info(f"Created new application deployment '{DEPLOYMENT_NAME}'.")
+            apps_api.read_namespaced_deployment(name, self.namespace)
+        except ApiException as error:
+            if error.status != NOT_FOUND_STATUS:
+                raise
+            apps_api.create_namespaced_deployment(namespace=self.namespace, body=body)
+            LOGGER.info("Created Deployment %s/%s", self.namespace, name)
+        else:
+            apps_api.patch_namespaced_deployment(name, self.namespace, body)
+            LOGGER.info("Updated Deployment %s/%s", self.namespace, name)
+
+    def job_deploy_ros_master(self) -> None:
+        """Create or update the ROS master Service and Deployment."""
+        _, core_api = self._clients()
+        service = self.build_ros_master_service()
+        try:
+            core_api.read_namespaced_service("ros-master", self.namespace)
+        except ApiException as error:
+            if error.status != NOT_FOUND_STATUS:
+                raise
+            core_api.create_namespaced_service(namespace=self.namespace, body=service)
+            LOGGER.info("Created Service %s/ros-master", self.namespace)
+        else:
+            core_api.patch_namespaced_service("ros-master", self.namespace, service)
+            LOGGER.info("Updated Service %s/ros-master", self.namespace)
+
+        self._upsert_deployment("ros-master", self.build_ros_master_deployment())
+
+    def _persistent_volume_body(self, volume: VolumeConfig) -> dict[str, Any]:
+        spec: dict[str, Any] = {
+            "capacity": {"storage": volume.size},
+            "accessModes": ["ReadWriteOnce"],
+            "hostPath": {"path": volume.host_path},
+            "persistentVolumeReclaimPolicy": "Retain",
+        }
+        if volume.storage_class:
+            spec["storageClassName"] = volume.storage_class
+        return {
+            "apiVersion": "v1",
+            "kind": "PersistentVolume",
+            "metadata": {"name": f"{volume.name}-pv"},
+            "spec": spec,
+        }
+
+    def _persistent_volume_claim_body(self, volume: VolumeConfig) -> dict[str, Any]:
+        spec: dict[str, Any] = {
+            "accessModes": ["ReadWriteOnce"],
+            "resources": {"requests": {"storage": volume.size}},
+        }
+        if volume.storage_class:
+            spec["storageClassName"] = volume.storage_class
+        if volume.host_path:
+            spec["volumeName"] = f"{volume.name}-pv"
+        return {
+            "apiVersion": "v1",
+            "kind": "PersistentVolumeClaim",
+            "metadata": {"name": f"{volume.name}-pvc", "namespace": self.namespace},
+            "spec": spec,
+        }
+
+    def job_create_persistent_storage(self) -> None:
+        """Create PVCs, and opt-in static hostPath PVs when explicitly requested."""
+        if not self.orch.persistent_storage:
+            return
+        _, core_api = self._clients()
+        for volume in self.orch.persistent_storage.volumes:
+            if volume.host_path:
+                pv_name = f"{volume.name}-pv"
+                pv_body = self._persistent_volume_body(volume)
+                try:
+                    core_api.read_persistent_volume(pv_name)
+                except ApiException as error:
+                    if error.status != NOT_FOUND_STATUS:
+                        raise
+                    core_api.create_persistent_volume(body=pv_body)
+                else:
+                    core_api.patch_persistent_volume(pv_name, pv_body)
+
+            pvc_name = f"{volume.name}-pvc"
+            pvc_body = self._persistent_volume_claim_body(volume)
+            try:
+                core_api.read_namespaced_persistent_volume_claim(pvc_name, self.namespace)
+            except ApiException as error:
+                if error.status != NOT_FOUND_STATUS:
+                    raise
+                core_api.create_namespaced_persistent_volume_claim(namespace=self.namespace, body=pvc_body)
             else:
-                LOGGER.warning(f"Error reading or updating application deployment: {e}")
+                core_api.patch_namespaced_persistent_volume_claim(pvc_name, self.namespace, pvc_body)
+
+    def job_deploy_application(self) -> None:
+        """Create or update the main ROS application Deployment."""
+        self._upsert_deployment(self.deployment_name, self.build_application_deployment())
+
+    def _install_helm_component(
+        self,
+        component: HelmComponentConfig,
+        namespace: str,
+        values_dir: Path,
+    ) -> None:
+        if not component.enabled:
+            return
+        command = [
+            "helm",
+            "upgrade",
+            "--install",
+            component.release,
+            component.chart,
+            "--namespace",
+            namespace,
+            "--create-namespace",
+            "--wait",
+            "--timeout",
+            "10m",
+        ]
+        if component.values:
+            values_path = values_dir / f"{component.release}-values.yaml"
+            values_path.write_text(yaml.safe_dump(component.values, sort_keys=False), encoding="utf-8")
+            command.extend(["--values", str(values_path)])
+        self._command_runner(command, check=True)
 
     def job_configure_observability(self) -> None:
-        """Configure the observability stack (Promtail, Loki, Prometheus, Grafana)."""
-        if not self.orch.observability or not self.orch.observability.enabled:
-            LOGGER.info("Observability is disabled; skipping configuration.")
+        """Install enabled Prometheus, Loki, and Grafana Helm releases."""
+        observability = self.orch.observability
+        if observability is None or not observability.enabled:
             return
+        if self._command_runner is subprocess.run and shutil.which("helm") is None:
+            msg = "Observability is enabled, but the 'helm' executable is not installed"
+            raise RuntimeError(msg)
 
-        LOGGER.info("Configuring observability stack (Promtail, Loki, Prometheus, Grafana)...")
-
-        # Implementation placeholder for observability stack setup
-        # In production, this would set up Helm charts or K8s manifests for:
-        # - Prometheus for metrics collection
-        # - Loki for log aggregation
-        # - Grafana for visualization dashboards
-        # - Promtail for log shipping
-
-        LOGGER.info("Observability stack configured successfully.")
+        with tempfile.TemporaryDirectory(prefix="rigel-observability-") as directory:
+            values_dir = Path(directory)
+            for component in (observability.prometheus, observability.loki, observability.grafana):
+                self._install_helm_component(component, observability.namespace, values_dir)
 
     def job_check_readiness(self) -> bool:
-        """Ensure the system is "ready" before any destructive action (like rolling update).
+        """Return whether at least one application pod exists and every container is ready."""
+        _, core_api = self._clients()
+        pods = core_api.list_namespaced_pod(
+            self.namespace,
+            label_selector=f"app.kubernetes.io/name={self.deployment_name}",
+        ).items
+        if not pods:
+            return False
+        for pod in pods:
+            statuses = pod.status.container_statuses or []
+            if pod.status.phase != "Running" or not statuses or not all(status.ready for status in statuses):
+                return False
+        return True
 
-        If a readiness command is provided, we might:
-        - Exec into the running container(s) to run a script
-        - Or rely on K8s readiness probes
-        For simplicity, let's rely on Pod 'Ready' status here, but illustrate how you'd do a custom check.
-        """
-        if not self.orch.readiness or not self.orch.readiness.command:
-            LOGGER.info("No readiness command is defined; assuming ready.")
+    def wait_until_ready(self) -> bool:
+        """Poll readiness until the configured timeout expires."""
+        if self.orch.readiness is None:
             return True
-
-        # Example approach: wait for all pods with 'app=<DEPLOYMENT_NAME>' to be in 'Ready' state.
-        # The user can further define or override logic as needed.
-        namespace = "default"
-
-        # Let's do a simplistic approach: check if all pods from that deployment are ready.
-        LOGGER.info("Checking readiness of application pods...")
-
-        for _ in range(30):  # up to e.g. 30 retries
-            pods = self._core_api.list_namespaced_pod(namespace, label_selector=f"app={DEPLOYMENT_NAME}").items
-            if not pods:
-                time.sleep(2)
-                continue
-
-            all_ready = True
-            for pod in pods:
-                cstatuses = pod.status.container_statuses or []
-                # A container is "ready" if cstatus.ready == True
-                # and the pod overall is also in Running phase
-                if pod.status.phase != "Running":
-                    all_ready = False
-                    break
-                for cstatus in cstatuses:
-                    if not cstatus.ready:
-                        all_ready = False
-                        break
-
-            if all_ready:
-                LOGGER.info("Pods are ready.")
+        timeout = self.orch.readiness.timeout_seconds
+        deadline = time.monotonic() + timeout
+        while True:
+            if self.job_check_readiness():
                 return True
-
-            time.sleep(2)
-
-        LOGGER.warning("Timeout: pods never became fully ready.")
-        return False
+            if time.monotonic() >= deadline:
+                return False
+            time.sleep(min(self.orch.readiness.period_seconds, max(0, deadline - time.monotonic())))
 
     def job_rolling_update(self) -> None:
-        """Execute a rolling update strategy for the app.
-
-        For demonstration, we just patch the Deployment with a new image or strategy.
-        (In real usage, you'd do more advanced or user-specified changes here.)
-        """
-        if not self.orch.rolling_update:
-            LOGGER.info("No rolling update config found; skipping.")
+        """Apply the configured Deployment update strategy."""
+        strategy = self._rolling_strategy()
+        if strategy is None:
             return
-
-        # Check readiness before continuing
-        if not self.job_check_readiness():
-            LOGGER.info("System is not ready, deferring rolling update.")
-            return
-
-        namespace = "default"
-
-        # Example patch: set the strategy
-        rolling_update_strategy = {
-            "spec": {
-                "strategy": {
-                    "type": "RollingUpdate",
-                    "rollingUpdate": {
-                        "maxSurge": self.orch.rolling_update.max_surge,
-                        "maxUnavailable": self.orch.rolling_update.max_unavailable,
-                    },
-                },
-            },
-        }
-
-        try:
-            self._apps_api.patch_namespaced_deployment(DEPLOYMENT_NAME, namespace, rolling_update_strategy)
-            LOGGER.info(f"Patched deployment '{DEPLOYMENT_NAME}' with rolling update strategy.")
-        except ApiException as e:
-            LOGGER.warning(f"Error applying rolling update: {e}")
+        apps_api, _ = self._clients()
+        apps_api.patch_namespaced_deployment(
+            self.deployment_name,
+            self.namespace,
+            {"spec": {"strategy": strategy}},
+        )
 
     def job_distributed_deployment(self) -> None:
-        """Apply node selectors / tolerations if 'distributed.enabled' is true (and not forced local).
-
-        TODO: This is a simplified example.
-        """
-        if not self.orch.distributed or not self.orch.distributed.enabled:
-            LOGGER.info("Distributed deployment is disabled; skipping.")
+        """Apply remote scheduling when distributed deployment requests it."""
+        distributed = self.orch.distributed
+        if (
+            distributed is None
+            or not distributed.enabled
+            or not distributed.default_to_remote
+            or distributed.force_local_flag
+        ):
             return
-
-        if self.orch.distributed.force_local_flag:
-            LOGGER.info("Distributed deployment is forced to local; skipping remote scheduling.")
-            return
-
-        # Example approach: patch the existing Deployment with a nodeSelector.
-        namespace = "default"
-
-        # If default_to_remote is true, we might set a nodeSelector to a known remote node label
-        node_selector = {
-            "spec": {
-                "template": {
-                    "spec": {
-                        "nodeSelector": {
-                            "deploymentType": "remote",  # or user-specified
-                        },
-                    },
-                },
-            },
-        }
-        try:
-            self._apps_api.patch_namespaced_deployment(DEPLOYMENT_NAME, namespace, node_selector)
-            LOGGER.info(f"Patched deployment '{DEPLOYMENT_NAME}' with remote nodeSelector.")
-        except ApiException as e:
-            LOGGER.warning(f"Error patching for distributed deployment: {e}")
-
-    # ----------------------------------------------------------------
-    # Plugin Lifecycle
-    # ----------------------------------------------------------------
-
-    def setup(self) -> None:
-        """Allocate or initialize resources needed for this plugin."""
-        LOGGER.info("[SETUP] OrchestrationPlugin setup.")
-        # For example, confirm cluster connectivity or pre-create any resources.
+        apps_api, _ = self._clients()
+        apps_api.patch_namespaced_deployment(
+            self.deployment_name,
+            self.namespace,
+            {"spec": {"template": {"spec": {"nodeSelector": {"deploymentType": "remote"}}}}},
+        )
 
     def start(self) -> None:
-        """Orchestrate the main logic of your plugin."""
-        LOGGER.info("[START] OrchestrationPlugin start.")
-
-        # 1) Deploy ros-master if configured
+        """Apply all configured resources and wait once for application readiness."""
+        if self.orch.observability_only or self.global_data.get("sequence_name") == "observability":
+            self.job_configure_observability()
+            return
+        self.setup()
         if self.orch.deploy_ros_master:
             self.job_deploy_ros_master()
-
-        # 2) Create persistent volumes if configured
-        if self.orch.persistent_storage:
-            self.job_create_persistent_storage()
-
-        # 3) Deploy the user application
+        self.job_create_persistent_storage()
         self.job_deploy_application()
-
-        # 4) Configure observability if enabled
         self.job_configure_observability()
-
-        # 5) Check readiness
-        #    (This also ensures that if the user wants to do a rolling update next,
-        #     we confirm the system is stable.)
-        is_ready = self.job_check_readiness()
-
-        if not is_ready:
-            LOGGER.warning("Application is not ready yet, but continuing plugin flow.")
-
-        # 6) Rolling update if user configured rolling_update
-        if self.orch.rolling_update:
-            self.job_rolling_update()
-
-        # 7) Distributed deployment if user enabled it
-        if self.orch.distributed and self.orch.distributed.enabled:
-            self.job_distributed_deployment()
+        if self.orch.readiness and not self.wait_until_ready():
+            msg = f"Deployment {self.namespace}/{self.deployment_name} did not become ready in time"
+            raise TimeoutError(msg)
 
     def process(self) -> None:
-        """Perform any post-deployment checks or logic, gather logs, etc."""
-        LOGGER.info("[PROCESS] Checking cluster for final status.")
-        # Could further monitor readiness, watch logs, etc.
-        # For example, re-run readiness or watch events.
+        """Validate the final application state when readiness is configured."""
+        if self.orch.readiness and not self.job_check_readiness():
+            msg = f"Deployment {self.namespace}/{self.deployment_name} is not ready"
+            raise RuntimeError(msg)
 
     def stop(self) -> None:
-        """Gracefully clean up or finalize resources.
-
-        In a real scenario, you might tear down ephemeral test deployments
-        or keep them up for production.
-        """
-        LOGGER.info("[STOP] OrchestrationPlugin stop.")
-        # Potentially delete resources or scale them down, etc.
-        # Alternatively, do nothing if the user wants the deployment to stay active.
+        """Leave deployed resources running; teardown is intentionally explicit."""
