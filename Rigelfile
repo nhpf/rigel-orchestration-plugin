@@ -29,11 +29,12 @@ jobs:
     plugin: "src.plugin.OrchestrationPlugin"
     with:
       orchestration:
+        application_image: "{{ vars.base_image }}"
         deploy_ros_master: true
         readiness:
           command: "/usr/local/bin/readiness_probe.sh"
         observability:
-          enabled: true
+          enabled: false
         rolling_update:
           strategy: "Rolling"
           max_surge: 1
@@ -107,6 +108,7 @@ jobs:
           max_unavailable: 0
         readiness:
           command: "/usr/local/bin/readiness_probe.sh"
+        application_image: "{{ vars.base_image }}"
 
 sequences:
   demo:

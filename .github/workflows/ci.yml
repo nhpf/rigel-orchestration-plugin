@@ -2,6 +2,9 @@ name: CI
 
 on: [push, pull_request]
 
+permissions:
+  contents: read
+
 jobs:
   build-test:
     runs-on: ubuntu-latest
@@ -10,10 +13,10 @@ jobs:
         python-version: ["3.10", "3.11", "3.12", "3.13"]
 
     steps:
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@v6
 
       - name: Set up Python
-        uses: actions/setup-python@v4
+        uses: actions/setup-python@v6
         with:
           python-version: ${{ matrix.python-version }}
 
@@ -39,5 +42,7 @@ jobs:
         uses: helm/kind-action@v1
 
       - name: Test with pytest
+        env:
+          RUN_K8S_INTEGRATION: "1"
         run: |
           poetry run pytest --cov=src --cov-report=term-missing
