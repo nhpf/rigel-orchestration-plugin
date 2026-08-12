@@ -12,6 +12,11 @@ dependencies = [
     "Jinja2>=3.1.4,<4.0.0",
 ]
 
+[project.urls]
+Homepage = "https://github.com/nhpf/rigel-orchestration-plugin"
+Repository = "https://github.com/nhpf/rigel-orchestration-plugin.git"
+Issues = "https://github.com/nhpf/rigel-orchestration-plugin/issues"
+
 [project.scripts]
 rigel-k8s = "src.cli:main"
 
@@ -33,7 +38,7 @@ pre-commit = "^4.0.1"
 line-length = 120
 lint.select = ["ALL"]
 lint.ignore = ["D100", "D104", "D203", "D213", "G004", "COM812", "ISC001"]
-exclude = ["venv", ".venv", "build", "dist"]
+exclude = ["venv", ".venv", "build", "dist", "app_testing", "docs"]
 
 [tool.ruff.lint.extend-per-file-ignores]
 "tests/**/*.py" = [
@@ -59,6 +64,7 @@ check_untyped_defs = true
 ignore_missing_imports = true
 strict_optional = true
 disable_error_code = ["import-untyped"]
+exclude = ["app_testing/", "docs/"]
 
 [tool.pytest.ini_options]
 minversion = "8.3"

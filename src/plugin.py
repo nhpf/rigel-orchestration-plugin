@@ -12,7 +12,7 @@ from typing import TYPE_CHECKING, Any, Protocol, cast
 
 import yaml
 from kubernetes import config
-from kubernetes.client import ApiException, AppsV1Api, CoreV1Api
+from kubernetes.client import ApiException, AppsV1Api, CoreV1Api, V1Pod
 from kubernetes.config.config_exception import ConfigException
 
 from .compat import ModelBuilder, PluginBase, get_logger
@@ -353,20 +353,57 @@ class OrchestrationPlugin(PluginBase):
             for component in (observability.prometheus, observability.loki, observability.grafana):
                 self._install_helm_component(component, observability.namespace, values_dir)
 
+    def _application_pods(self) -> list[V1Pod]:
+        """Return pods owned by the configured application Deployment."""
+        _, core_api = self._clients()
+        return list(
+            core_api.list_namespaced_pod(
+                self.namespace,
+                label_selector=f"app.kubernetes.io/name={self.deployment_name}",
+            ).items,
+        )
+
+    @staticmethod
+    def _pod_is_ready(pod: V1Pod) -> bool:
+        """Return whether a pod is running and all of its containers are ready."""
+        statuses = pod.status.container_statuses or []
+        return pod.status.phase == "Running" and bool(statuses) and all(status.ready for status in statuses)
+
     def job_check_readiness(self) -> bool:
         """Return whether at least one application pod exists and every container is ready."""
-        _, core_api = self._clients()
-        pods = core_api.list_namespaced_pod(
-            self.namespace,
-            label_selector=f"app.kubernetes.io/name={self.deployment_name}",
-        ).items
+        pods = self._application_pods()
         if not pods:
             return False
-        for pod in pods:
-            statuses = pod.status.container_statuses or []
-            if pod.status.phase != "Running" or not statuses or not all(status.ready for status in statuses):
-                return False
-        return True
+        return all(self._pod_is_ready(pod) for pod in pods)
+
+    def collect_results(self, destination: Path) -> Path:
+        """Copy configured results from the newest ready application pod."""
+        results = self.orch.results
+        if results is None:
+            msg = "Result collection requires orchestration.results.source_path"
+            raise ValueError(msg)
+        if self._command_runner is subprocess.run and shutil.which("kubectl") is None:
+            msg = "Result collection requires the 'kubectl' executable"
+            raise RuntimeError(msg)
+
+        ready_pods = [pod for pod in self._application_pods() if self._pod_is_ready(pod)]
+        if not ready_pods:
+            msg = f"No ready pods found for Deployment {self.namespace}/{self.deployment_name}"
+            raise RuntimeError(msg)
+        ready_pods.sort(key=lambda pod: str(pod.metadata.creation_timestamp or ""))
+        pod = ready_pods[-1]
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        command = [
+            "kubectl",
+            "cp",
+            f"{self.namespace}/{pod.metadata.name}:{results.source_path}",
+            str(destination),
+            "--container",
+            results.container,
+        ]
+        self._command_runner(command, check=True)
+        LOGGER.info("Collected results from %s/%s into %s", self.namespace, pod.metadata.name, destination)
+        return destination
 
     def wait_until_ready(self) -> bool:
         """Poll readiness until the configured timeout expires."""
@@ -430,6 +467,63 @@ class OrchestrationPlugin(PluginBase):
         if self.orch.readiness and not self.job_check_readiness():
             msg = f"Deployment {self.namespace}/{self.deployment_name} is not ready"
             raise RuntimeError(msg)
+
+    def _uninstall_observability(self) -> None:
+        """Uninstall enabled Helm releases when explicitly requested."""
+        observability = self.orch.observability
+        if observability is None or not observability.enabled:
+            return
+        if self._command_runner is subprocess.run and shutil.which("helm") is None:
+            msg = "Observability cleanup requires the 'helm' executable"
+            raise RuntimeError(msg)
+        for component in (observability.prometheus, observability.loki, observability.grafana):
+            if component.enabled:
+                self._command_runner(
+                    [
+                        "helm",
+                        "uninstall",
+                        component.release,
+                        "--namespace",
+                        observability.namespace,
+                        "--ignore-not-found",
+                    ],
+                    check=True,
+                )
+
+    @staticmethod
+    def _delete_if_exists(action: Callable[..., Any], *args: str) -> None:
+        """Delete a Kubernetes resource while treating absence as success."""
+        try:
+            action(*args)
+        except ApiException as error:
+            if error.status != NOT_FOUND_STATUS:
+                raise
+
+    def cleanup(self, *, delete_storage: bool = False, uninstall_observability: bool = False) -> None:
+        """Delete managed workloads, preserving storage and Helm releases by default."""
+        apps_api, core_api = self._clients()
+        if not self.orch.observability_only:
+            deployments = [self.deployment_name]
+            if self.orch.deploy_ros_master:
+                deployments.append("ros-master")
+            for deployment in deployments:
+                self._delete_if_exists(apps_api.delete_namespaced_deployment, deployment, self.namespace)
+
+            if self.orch.deploy_ros_master:
+                self._delete_if_exists(core_api.delete_namespaced_service, "ros-master", self.namespace)
+
+            if delete_storage and self.orch.persistent_storage:
+                for volume in self.orch.persistent_storage.volumes:
+                    self._delete_if_exists(
+                        core_api.delete_namespaced_persistent_volume_claim,
+                        f"{volume.name}-pvc",
+                        self.namespace,
+                    )
+                    if volume.host_path:
+                        self._delete_if_exists(core_api.delete_persistent_volume, f"{volume.name}-pv")
+
+        if uninstall_observability:
+            self._uninstall_observability()
 
     def stop(self) -> None:
         """Leave deployed resources running; teardown is intentionally explicit."""

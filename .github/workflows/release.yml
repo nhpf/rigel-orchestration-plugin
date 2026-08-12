@@ -1,0 +1,37 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+env:
+  POETRY_VERSION: "2.4.1"
+
+jobs:
+  github-release:
+    name: build and publish GitHub release
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.13"
+      - name: Install Poetry
+        run: python -m pip install "poetry==${POETRY_VERSION}"
+      - name: Verify tag matches package version
+        run: test "${GITHUB_REF_NAME}" = "v$(poetry version --short)"
+      - name: Build wheel and source archive
+        run: poetry build
+      - name: Upload workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: python-distributions
+          path: dist/
+      - name: Create GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "${GITHUB_REF_NAME}" dist/* --generate-notes --verify-tag

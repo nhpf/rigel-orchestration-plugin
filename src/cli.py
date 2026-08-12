@@ -76,9 +76,30 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("rigelfile", nargs="?", type=Path, default=Path("Rigelfile"))
     parser.add_argument("--job", help="orchestration job name (auto-detected by default)")
-    parser.add_argument("--dry-run", action="store_true", help="print Kubernetes YAML without contacting a cluster")
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument("--dry-run", action="store_true", help="print Kubernetes YAML without contacting a cluster")
+    mode.add_argument(
+        "--collect-results",
+        type=Path,
+        metavar="DESTINATION",
+        help="copy configured results from the newest ready application pod without deploying",
+    )
+    mode.add_argument("--cleanup", action="store_true", help="delete managed workloads without deleting storage")
+    parser.add_argument(
+        "--delete-storage",
+        action="store_true",
+        help="with --cleanup, also permanently delete managed PVCs and hostPath PVs",
+    )
+    parser.add_argument(
+        "--uninstall-observability",
+        action="store_true",
+        help="with --cleanup, also uninstall enabled observability Helm releases",
+    )
     parser.add_argument("--verbose", action="store_true")
     args = parser.parse_args(argv)
+
+    if (args.delete_storage or args.uninstall_observability) and not args.cleanup:
+        parser.error("--delete-storage and --uninstall-observability require --cleanup")
 
     logging.basicConfig(level=logging.DEBUG if args.verbose else logging.INFO)
     document = load_rigelfile(args.rigelfile)
@@ -96,6 +117,15 @@ def main(argv: list[str] | None = None) -> int:
     )
     if args.dry_run:
         sys.stdout.write(yaml.safe_dump_all(_dry_run_documents(plugin), sort_keys=False))
+        return 0
+    if args.collect_results is not None:
+        plugin.collect_results(args.collect_results)
+        return 0
+    if args.cleanup:
+        plugin.cleanup(
+            delete_storage=args.delete_storage,
+            uninstall_observability=args.uninstall_observability,
+        )
         return 0
     plugin.start()
     return 0
